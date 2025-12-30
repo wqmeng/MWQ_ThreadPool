@@ -1,0 +1,18 @@
+static/
+# Delphi
+*.~*
+*.dcu
+*.local
+*.identcache
+*.stat
+*.identcache
+__history/
+__recovery/
+*.exe
+*.dll
+dunitx-results.xml
+
+# Git
+.git/
+asset/
+res/

@@ -1,0 +1,36 @@
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <ProjectGuid>{B024EF4C-B93B-40C9-A005-D0AB38E0FFCA}</ProjectGuid>
+    </PropertyGroup>
+    <ItemGroup>
+        <Projects Include="MWQ_ThreadPool.dproj">
+            <Dependencies/>
+        </Projects>
+    </ItemGroup>
+    <ProjectExtensions>
+        <Borland.Personality>Default.Personality.12</Borland.Personality>
+        <Borland.ProjectType/>
+        <BorlandProject>
+            <Default.Personality/>
+        </BorlandProject>
+    </ProjectExtensions>
+    <Target Name="MWQ_ThreadPool">
+        <MSBuild Projects="MWQ_ThreadPool.dproj"/>
+    </Target>
+    <Target Name="MWQ_ThreadPool:Clean">
+        <MSBuild Projects="MWQ_ThreadPool.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="MWQ_ThreadPool:Make">
+        <MSBuild Projects="MWQ_ThreadPool.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Build">
+        <CallTarget Targets="MWQ_ThreadPool"/>
+    </Target>
+    <Target Name="Clean">
+        <CallTarget Targets="MWQ_ThreadPool:Clean"/>
+    </Target>
+    <Target Name="Make">
+        <CallTarget Targets="MWQ_ThreadPool:Make"/>
+    </Target>
+    <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>
