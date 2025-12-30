@@ -25,7 +25,7 @@ uses
 
   Example:
      TASK_KIND_SAVECACHE = 1;
-     TASK_KIND_TRANSLATE   = 2;
+     TASK_KIND_TRANSLATE = 2;
 ============================================================================ }
 
 const
