@@ -146,7 +146,7 @@ begin
             Inc(FJobsStarted);           
             Job.BeginWrite;
             try
-              if TCacheSavor.Save(Job.Data) then begin
+              if TCacheSaver.Save(Job.Data) then begin
                 //              Sleep(1000);
                 //              if True then begin
                 Inc(FJobsCompleted);
