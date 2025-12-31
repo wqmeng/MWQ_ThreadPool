@@ -14,7 +14,7 @@ const
 
 type
   TWorkerKind = (wkBase, wkDynamic, wkBurst, wkQuota);
-  TWorkerState = (wsIdle, wsActive, wsQuit);
+  TWorkerState = (wsIdle, wsBusy, wsStopping);
 
   TWorkerInfo = record
     Kind: TWorkerKind;
@@ -94,11 +94,15 @@ type
         FOwner: TCommonThreadPool;
         FState: TWorkerState;
         FKind: TWorkerKind;
+        FLastActiveTick: UInt64;
         procedure SetState(AState: TWorkerState);
       protected
         procedure Execute; override;
       public
-        constructor Create(AOwner: TCommonThreadPool; CPU: Integer);
+        constructor Create(AOwner: TCommonThreadPool);
+      public
+        property State: TWorkerState read FState write FState;
+        property LastActiveTick: UInt64 read FLastActiveTick;
       end;
 
   private
@@ -111,6 +115,7 @@ type
     FQueueLocks: array[0..PRIORITY_MAX] of TCriticalSection;
     FQueueEvent: TEvent;
     FQueueDepth: Integer;
+    FQueueQuota: Integer;
 
     FKeyLocks: TDictionary<UIntPtr, TLightweightMREW>;
     FKeyLockCS: TCriticalSection;
@@ -130,6 +135,7 @@ type
     FMinWorkers: Integer;
     FMaxWorkers: Integer;
     FBurstLimit: Integer;
+    FBurstIdleTimeoutMs: Cardinal;
     FIdleTimeoutMs: Cardinal;
 
     FWorkersBurst: Integer;
@@ -168,9 +174,12 @@ type
     function TryTakeQuotaTaskAny: IThreadTask;
     function TryTakeQuotaTaskByKind(Kind: Integer): IThreadTask;
     procedure EnqueueQuotaTask(const Task: IThreadTask);
-    procedure SpawnBurstWorker;
     procedure OnBurstWorkerExit(Worker: TWorker);
     function HasKindQuota(Kind: Integer): Boolean;
+    procedure CheckScale;
+    procedure SpawnWorker;
+    procedure RetireIdleWorker;
+    procedure SpawnBurstWorker;
   protected
   public
     class function GetInstance: TCommonThreadPool;
@@ -214,6 +223,7 @@ type
 
     property QueueDepth: Integer read FQueueDepth;
     property BurstLimit: Integer read FBurstLimit write FBurstLimit;
+    property IdleTimeoutMs: Cardinal read FIdleTimeoutMs write FIdleTimeoutMs;
     {**
   FDropTaskOnThrottle:
 
@@ -301,16 +311,20 @@ begin
   Result := Min(5 + Retry * Retry * 10, 500);
 end;
 
+function GetLogicalCPUCount: Integer;
+begin
+  Result := GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+end;
+
 // ---------------------------- WORKER ----------------------------
 
-constructor TCommonThreadPool.TWorker.Create(AOwner: TCommonThreadPool; CPU: Integer);
+constructor TCommonThreadPool.TWorker.Create(AOwner: TCommonThreadPool);
 begin
   inherited Create(False);
   FreeOnTerminate := False;
   FOwner := AOwner;
   FState := wsIdle;
   FKind := wkBase;
-  SetThreadAffinityMask(GetCurrentThread, UIntPtr(1) shl CPU);
 end;
 
 procedure TCommonThreadPool.TWorker.SetState(AState: TWorkerState);
@@ -365,7 +379,7 @@ var
   Tid: Cardinal;
 begin
   Tid := GetCurrentThreadId;
-  SetState(wsActive);
+  SetState(wsBusy);
 
 {$IFDEF DEBUG}
   Log(Format('Worker start [TID=%d Kind=%s]', [Tid, WorkerKindToStr(Self.FKind)]), etDebug);
@@ -421,10 +435,11 @@ begin
       Log(Format('Worker idle wait [TID=%d]', [Tid]), etDebug);
 {$ENDIF}
 
+      //      FLastActiveTick := GetTickCount64;
       SetState(wsIdle);
       FOwner.FQueueEvent.ResetEvent;
       FOwner.FQueueEvent.WaitFor(INFINITE);
-      SetState(wsActive);
+      SetState(wsBusy);
       Continue;
     end;
 
@@ -529,12 +544,13 @@ begin
           Dec(FOwner.FQuotaCount);
           Inc(FOwner.FBaseCount);
         end;
-
       end;
+      FLastActiveTick := GetTickCount64;
+      Self.FOwner.CheckScale;
     end;
   end;
 
-  SetState(wsQuit);
+  SetState(wsStopping);
 
 {$IFDEF DEBUG}
   Log(Format('Worker exit [TID=%d]', [Tid]), etDebug);
@@ -639,11 +655,23 @@ begin
   GetInstance._CancelByOwner(Owner);
 end;
 
+procedure TCommonThreadPool.CheckScale;
+begin
+  // Scale UP
+  if ((FQueueDepth - FQueueQuota) > FBaseCount * 2) and (FWorkersTotal < FMaxWorkers) then
+    SpawnWorker;
+
+  // Scale DOWN
+  if (FWorkersIdle > 0) and (FWorkersTotal > FMinWorkers) then
+    RetireIdleWorker;
+end;
+
 { ================= Thread Pool ================= }
 
 constructor TCommonThreadPool.Create(WorkerCount: Integer);
 var
   I, P: Integer;
+  CPU: Integer;
 begin
   FTaskKinds := TDictionary<Integer, TTaskKindConfig>.Create;
   FQueueEvent := TEvent.Create(nil, True, False, '');
@@ -672,7 +700,18 @@ begin
   FQuotaByKind := TDictionary<Integer, Integer>.Create;
   FQuotaCS := TCriticalSection.Create;
 
-  FBurstLimit := 4;
+  CPU := System.CPUCount;
+  if CPU < 1 then
+    CPU := 1;
+  FMinWorkers := Max(1, CPU div 2);
+  FMaxWorkers := CPU * 2;
+
+  FBurstLimit := Max(2, CPU div 2);
+  FIdleTimeoutMs := 60_000; // 1 minutes idle timeout
+
+  // CLAMP WorkerCount HERE
+  WorkerCount := EnsureRange(WorkerCount, FMinWorkers, FMaxWorkers);
+
   SetLength(FWorkers, WorkerCount);
   FWorkersIdle := Length(FWorkers);
   FWorkersTotal := 0;
@@ -680,7 +719,8 @@ begin
   for I := 0 to WorkerCount - 1 do begin
     Inc(FWorkersTotal);
     Inc(FBaseCount);
-    FWorkers[I] := TWorker.Create(Self, I);
+    FWorkers[I] := TWorker.Create(Self);
+    FWorkers[I].FreeOnTerminate := false;
   end;
 end;
 
@@ -1034,18 +1074,23 @@ begin
 {$ENDIF}
 
   { Burst worker }
-  if (Task.Priority >= 5) and (FWorkersIdle = 0) and (FWorkersTotal < FMaxWorkers + FBurstLimit) then begin
+  if not IsRequeue then begin
+    if (Task.Priority >= 5) and (FWorkersIdle = 0) and (FWorkersTotal < FMaxWorkers + FBurstLimit) then begin
 {$IFDEF DEBUG}
-    Log(
-        Format(
-            'ThreadPool.SpawnBurstWorker (Reason=HighPriority Kind=%d Key=%x Workers=%d Idle=%d)',
-            [Kind, Task.Key, FWorkersTotal, FWorkersIdle]
-        ),
-        etDebug
-    );
+      Log(
+          Format(
+              'ThreadPool.SpawnBurstWorker (Reason=HighPriority Kind=%d Key=%x Workers=%d Idle=%d)',
+              [Kind, Task.Key, FWorkersTotal, FWorkersIdle]
+          ),
+          etDebug
+      );
 {$ENDIF}
 
-    SpawnBurstWorker;
+      SpawnBurstWorker;
+    end
+    else begin
+      CheckScale;
+    end;
   end;
 
   FQueueEvent.SetEvent;
@@ -1342,6 +1387,51 @@ begin
   GetInstance._RegisterTaskKind(AKind, AName, MaxWorkers, RateCapacity, RateRefillPerSec);
 end;
 
+procedure TCommonThreadPool.RetireIdleWorker;
+var
+  I, J: Integer;
+  Worker: TWorker;
+  NowTick: UInt64;
+  Len: Integer;
+begin
+  NowTick := GetTickCount64;
+
+  FWorkerCS.Enter;
+  try
+    if FWorkersTotal <= FMinWorkers then
+      Exit;
+
+    Len := Length(FWorkers);
+
+    for I := Len - 1 downto 0 do begin
+      Worker := FWorkers[I];
+
+      if (Worker.State = wsIdle) and (NowTick - Worker.LastActiveTick >= FIdleTimeoutMs) then begin
+        Worker.SetState(wsStopping);
+
+        Dec(FWorkersIdle);
+        Dec(FWorkersTotal);
+
+        // Shift elements down
+        for J := I to Len - 2 do
+          FWorkers[J] := FWorkers[J + 1];
+
+        SetLength(FWorkers, Len - 1);
+
+        // Terminate and free the worker
+        Worker.Terminate;
+        FQueueEvent.SetEvent;
+        Worker.WaitFor;
+        Worker.Free;
+
+        Exit; // retire ONE at a time
+      end;
+    end;
+  finally
+    FWorkerCS.Leave;
+  end;
+end;
+
 procedure TCommonThreadPool.SetKindQuota(Kind: Integer; MaxWorkers: Integer);
 var
   Q: TQueue<IThreadTask>;
@@ -1429,7 +1519,7 @@ begin
     if FWorkersTotal >= FMaxWorkers + FBurstLimit then
       Exit;
 
-    W := TWorker.Create(Self, 0);
+    W := TWorker.Create(Self);
     W.FKind := wkBurst;
     Inc(FWorkersTotal);
     Inc(FWorkersBurst);
@@ -1437,6 +1527,30 @@ begin
     SetLength(FBurstWorkers, Length(FBurstWorkers) + 1);
     FBurstWorkers[High(FBurstWorkers)] := W;
     W.Start;
+  finally
+    FWorkerCS.Leave;
+  end;
+end;
+
+procedure TCommonThreadPool.SpawnWorker;
+var
+  Worker: TWorker;
+begin
+  FWorkerCS.Enter;
+  try
+    if FWorkersTotal >= FMaxWorkers then
+      Exit;
+
+    Worker := TWorker.Create(Self);
+    Inc(FWorkersTotal);
+    Inc(FWorkersIdle);
+
+    Worker.FreeOnTerminate := False;
+
+    SetLength(FWorkers, Length(FWorkers) + 1);
+    FWorkers[High(FWorkers)] := Worker;
+
+    Worker.Start;
   finally
     FWorkerCS.Leave;
   end;
