@@ -481,6 +481,7 @@ begin
 {$IFDEF DEBUG}
       Log(Format('Task cancelled skip [TID=%d Kind=%d Key=%x]', [Tid, Task.Kind, Task.Key]), etDebug);
 {$ENDIF}
+      FOwner.DoTaskFinished(Task, TTaskResult.trCanceled, 0, 0);
       Continue;
     end;
 
@@ -494,6 +495,7 @@ begin
 
       Task.Cancel;
       FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].Expired);
+      FOwner.DoTaskFinished(Task, TTaskResult.trCanceled, 0, 0);
       Continue;
     end;
 
@@ -519,9 +521,18 @@ begin
 
         FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].QuotaDenied);
         FOwner.EnqueueQuotaTask(Task);
+
+        // Quota Full. Change from wkQuota to wkBase;
+        if Self.FKind = wkQuota then begin
+          Self.FKind := wkBase;
+          Dec(FOwner.FQuotaCount);
+          Inc(FOwner.FBaseCount);
+        end;
+
         Continue; // ✅ IMPORTANT: continue, never break
       end;
 
+      // Deal Quota, Change from wkBase to wkQuota;
       if Self.FKind = wkBase then begin
         Self.FKind := wkQuota;
         Inc(FOwner.FQuotaCount);
