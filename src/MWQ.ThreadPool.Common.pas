@@ -28,7 +28,11 @@ type
     RateRefillPerSec: Int64;
   end;
 
-  TSimpleTaskProc = reference to procedure;
+  TTaskStatus = (tsPending, tsRunning, tsSucceeded, tsFailed, tsCanceled);
+
+  TTaskResult = (trSucceeded, trFailed, trCanceled);
+
+  TSimpleTaskFunc = reference to function: Boolean;
   TMetricKind = (mkEnqueued, mkStarted, mkCompleted, mkFailed, mkExpired);
 
   IThreadTask = interface
@@ -38,12 +42,13 @@ type
     function Kind: Integer;
     function Priority: Byte;
     function DeadlineTick: UInt64;
-    procedure Execute;
+    procedure Run;
     function TaskDone: Boolean;
     function CanRetry: Boolean;
     procedure Cancel;
     function IsCancelled: Boolean;
     procedure Cleanup;
+    function Context: TObject;
   end;
 
   TThreadPoolMetrics = record
@@ -64,8 +69,9 @@ type
   end;
 
   TThreadPoolWorkerStats = record
+    MinWorkers, MaxWorkers: Integer;
     TotalWorkers: Integer;
-    ActiveWorkers: Integer;
+    BusyWorkers: Integer;
     IdleWorkers: Integer;
     BaseWorkers: Integer;
     QuotaWorkers: Integer;
@@ -81,6 +87,14 @@ type
     RefillPerSec: Int64;
     LastTick: UInt64;
   end;
+
+  TOnTaskFinished =
+      procedure(
+          const ATask: IThreadTask;
+          const AResult: TTaskResult;
+          const ARetryCount: Integer;
+          const AExecTimeUs: UInt64
+      ) of object;
 
   TCommonThreadPool = class
   private
@@ -140,12 +154,15 @@ type
 
     FWorkersBurst: Integer;
     FWorkersTotal: Integer;
-    FWorkersActive: Integer;
+    FWorkersBusy: Integer;
     FWorkersIdle: Integer;
 
     FBaseCount, FDynamicCount, FBurstCount, FQuotaCount: Integer;
     FWorkerCS: TCriticalSection;
     FDropTaskOnThrottle: Boolean;
+    FMaxRetry: Integer;
+
+    FOnTaskFinished: TOnTaskFinished;
 
     function DequeueTask: IThreadTask;
     function GetKind(const Task: IThreadTask): Integer;
@@ -180,19 +197,26 @@ type
     procedure SpawnWorker;
     procedure RetireIdleWorker;
     procedure SpawnBurstWorker;
+    procedure DoTaskFinished(
+        const ATask: IThreadTask;
+        const AResult: TTaskResult;
+        const ARetryCount: Integer;
+        const AExecTimeUs: UInt64
+    );
   protected
   public
     class function GetInstance: TCommonThreadPool;
 
     class procedure EnqueueTask(const Task: IThreadTask); static;
     class procedure EnqueueProc(
-        const Proc: TSimpleTaskProc;
+        const AFunc: TFunc<Boolean>;
         APriority: Byte = 0;
         AKind: Integer = 0;
         ATaskOwner: UIntPtr = 0;
         AKey: UIntPtr = 0;
         ADeadlineTick: UInt64 = 0;
-        ACanRetry: Boolean = False
+        ACanRetry: Boolean = False;
+        AContext: TObject = nil
     ); static;
     class procedure RegisterTaskKind(
         AKind: Integer;
@@ -217,6 +241,7 @@ type
     procedure AddMetrics(var Dst: TThreadPoolMetrics; const Src: TThreadPoolMetrics);
     function GetMetricsSummary: TThreadPoolMetrics;
     function GetMetricsByKind: TDictionary<Integer, TThreadPoolMetrics>;
+    function GetKindConfig(const AKind: Integer; var KindCfg: TTaskKindConfig): Boolean;
     function GetMetricsForKind(Kind: Integer; out Metrics: TThreadPoolMetrics): Boolean;
     function AvgExecTimeUs(const M: TThreadPoolMetrics): Double;
     function DumpThreadPoolStats: string;
@@ -224,6 +249,7 @@ type
     property QueueDepth: Integer read FQueueDepth;
     property BurstLimit: Integer read FBurstLimit write FBurstLimit;
     property IdleTimeoutMs: Cardinal read FIdleTimeoutMs write FIdleTimeoutMs;
+    property MaxRetry: Integer read FMaxRetry write FMaxRetry;
     {**
   FDropTaskOnThrottle:
 
@@ -258,11 +284,13 @@ type
   Default: FALSE
 **}
     property DropTaskOnThrottle: Boolean read FDropTaskOnThrottle write FDropTaskOnThrottle;
+    property OnTaskFinished: TOnTaskFinished read FOnTaskFinished write FOnTaskFinished;
   end;
 
   TAnonymousThreadTask = class(TInterfacedObject, IThreadTask)
   private
-    FProc: TSimpleTaskProc;
+    FSuccess: Boolean;
+    FFunc: TFunc<Boolean>;
     FPriority: Byte;
     FKey: UIntPtr;
     FKind: Integer;
@@ -271,27 +299,31 @@ type
     FCanRetry: Boolean;
     FDone: Boolean;
     FDeadlineTick: UInt64;
+    FContext: TObject;
   public
     constructor Create(
-        const AProc: TSimpleTaskProc;
+        const AFunc: TFunc<Boolean>;
         APriority: Byte;
         AKind: Integer;
         AOwner: UIntPtr;
         AKey: UIntPtr;
         ADeadlineTick: UInt64;
-        ACanRetry: Boolean
+        ACanRetry: Boolean;
+        AContext: TObject
     );
+    destructor Destroy; override;
     function Key: UIntPtr;
     function Owner: UIntPtr;
     function Priority: Byte;
     function DeadlineTick: UInt64;
-    procedure Execute;
+    procedure Run;
     function TaskDone: Boolean;
     function CanRetry: Boolean;
     procedure Cancel;
     function IsCancelled: Boolean;
     procedure Cleanup;
     function Kind: Integer;
+    function Context: TObject;
   end;
 
   TMWQThreadPool = TCommonThreadPool;
@@ -337,16 +369,16 @@ begin
     if FState = wsIdle then
       Dec(FOwner.FWorkersIdle)
     else
-      Dec(FOwner.FWorkersActive);
+      Dec(FOwner.FWorkersBusy);
 
     if AState = wsIdle then
       Inc(FOwner.FWorkersIdle)
     else
-      Inc(FOwner.FWorkersActive);
+      Inc(FOwner.FWorkersBusy);
 
     FState := AState;
     if FState = wsIdle then begin
-      if Self.FKind <> wkBase then begin
+      if Self.FKind = wkQuota then begin
         Self.FKind := wkBase;
         Dec(FOwner.FQuotaCount);
         Inc(FOwner.FBaseCount);
@@ -374,9 +406,10 @@ procedure TCommonThreadPool.TWorker.Execute;
 var
   Task: IThreadTask;
   Kind: Integer;
-  Retry: Integer;
+  LRetry: Integer;
   StartTick, Latency: UInt64;
   Tid: Cardinal;
+  LResult: TTaskResult;
 begin
   Tid := GetCurrentThreadId;
   SetState(wsBusy);
@@ -421,7 +454,7 @@ begin
         );
 {$ENDIF}
 
-        if Self.FKind <> wkQuota then begin
+        if Self.FKind = wkBase then begin
           Self.FKind := wkQuota;
           Inc(FOwner.FQuotaCount);
           Dec(FOwner.FBaseCount);
@@ -506,31 +539,39 @@ begin
 
     FOwner.EnterKey(Task.Key);
     try
-      Retry := 0;
+      LRetry := 0;
       StartTick := GetTickCount64;
       FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].Started);
 
       while True do begin
-        Task.Execute;
+        Task.Run;
 
-        if Task.TaskDone then
-          Break;
-
-        if not Task.CanRetry or (Retry >= 5) then begin
-          FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].Failed);
+        if Task.TaskDone then begin
+          if Task.IsCancelled then
+            LResult := TTaskResult.trCanceled
+          else
+            LResult := TTaskResult.trSucceeded;
           Break;
         end;
 
-        Inc(Retry);
+        if not Task.CanRetry or (LRetry >= FOwner.FMaxRetry) then begin
+          FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].Failed);
+          LResult := TTaskResult.trFailed;
+          Break;
+        end;
+
+        Inc(LRetry);
         FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].Retried);
-        Sleep(BackoffMs(Retry));
+        Sleep(BackoffMs(LRetry));
       end;
 
       Latency := (GetTickCount64 - StartTick) * 1000;
       FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].ExecTimeUsTotal, Latency);
 
-      if Task.TaskDone then
-        FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].Completed);
+      //      if Task.TaskDone then
+      FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].Completed);
+
+      FOwner.DoTaskFinished(Task, LResult, LRetry, Latency);
 
     finally
       Task.Cleanup;
@@ -708,6 +749,7 @@ begin
 
   FBurstLimit := Max(2, CPU div 2);
   FIdleTimeoutMs := 60_000; // 1 minutes idle timeout
+  FMaxRetry := 2;
 
   // CLAMP WorkerCount HERE
   WorkerCount := EnsureRange(WorkerCount, FMinWorkers, FMaxWorkers);
@@ -789,16 +831,17 @@ end;
 // ---------------------------- TAnonymousThreadTask ----------------------------
 
 constructor TAnonymousThreadTask.Create(
-    const AProc: TSimpleTaskProc;
+    const AFunc: TFunc<Boolean>;
     APriority: Byte;
     AKind: Integer;
     AOwner, AKey: UIntPtr;
     ADeadlineTick: UInt64;
-    ACanRetry: Boolean
+    ACanRetry: Boolean;
+    AContext: TObject
 );
 begin
   inherited Create;
-  FProc := AProc;
+  FFunc := AFunc;
   FPriority := APriority;
   FKind := AKind;
   FOwner := AOwner;
@@ -806,6 +849,7 @@ begin
   FDeadlineTick := ADeadlineTick;
   FCanRetry := ACanRetry;
   FDone := False;
+  FContext := AContext;
 end;
 
 function TAnonymousThreadTask.Key: UIntPtr;
@@ -828,22 +872,37 @@ begin
   Result := FDeadlineTick;
 end;
 
-procedure TAnonymousThreadTask.Execute;
+destructor TAnonymousThreadTask.Destroy;
 begin
-  if FCanceled then
+  FContext := nil;
+  inherited;
+end;
+
+procedure TAnonymousThreadTask.Run;
+begin
+  if FCanceled then begin
+    FSuccess := False;
     Exit;
-  FProc();
-  FDone := True;
+  end;
+
+  try
+    FSuccess := FFunc();
+  except
+    on E: Exception do begin
+      FSuccess := False;
+      // store E.Message if needed
+    end;
+  end;
 end;
 
 function TAnonymousThreadTask.TaskDone: Boolean;
 begin
-  Result := FDone;
+  Result := FSuccess or FCanceled;
 end;
 
 function TAnonymousThreadTask.CanRetry: Boolean;
 begin
-  Result := FCanRetry;
+  Result := FCanRetry and (not FSuccess) and (not FCanceled);
 end;
 
 procedure TAnonymousThreadTask.Cancel;
@@ -858,6 +917,12 @@ end;
 
 procedure TAnonymousThreadTask.Cleanup;
 begin
+  FFunc := nil; // release closure
+end;
+
+function TAnonymousThreadTask.Context: TObject;
+begin
+  Result := FContext;
 end;
 
 function TAnonymousThreadTask.Kind: Integer;
@@ -940,6 +1005,21 @@ begin
   FWorkerCS.Free;
 
   inherited;
+end;
+
+procedure TCommonThreadPool.DoTaskFinished(
+    const ATask: IThreadTask;
+    const AResult: TTaskResult;
+    const ARetryCount: Integer;
+    const AExecTimeUs: UInt64
+);
+var
+  LTask: IThreadTask;
+begin
+  if Assigned(FOnTaskFinished) then begin
+    LTask := ATask; // pin interface reference
+    TThread.Queue(nil, procedure begin FOnTaskFinished(LTask, AResult, ARetryCount, AExecTimeUs); end);
+  end;
 end;
 
 function TCommonThreadPool.DumpThreadPoolStats: string;
@@ -1097,16 +1177,19 @@ begin
 end;
 
 class procedure TCommonThreadPool.EnqueueProc(
-    const Proc: TSimpleTaskProc;
+    const AFunc: TFunc<Boolean>;
     APriority: Byte = 0;
     AKind: Integer = 0;
     ATaskOwner: UIntPtr = 0;
     AKey: UIntPtr = 0;
     ADeadlineTick: UInt64 = 0;
-    ACanRetry: Boolean = False
+    ACanRetry: Boolean = False;
+    AContext: TObject = nil
 );
 begin
-  EnqueueTask(TAnonymousThreadTask.Create(Proc, APriority, AKind, ATaskOwner, AKey, ADeadlineTick, ACanRetry));
+  EnqueueTask(
+      TAnonymousThreadTask.Create(AFunc, APriority, AKind, ATaskOwner, AKey, ADeadlineTick, ACanRetry, AContext)
+  );
 end;
 
 procedure TCommonThreadPool.EnqueueQuotaTask(const Task: IThreadTask);
@@ -1196,6 +1279,17 @@ end;
 function TCommonThreadPool.GetKind(const Task: IThreadTask): Integer;
 begin
   Result := Task.Kind
+end;
+
+function TCommonThreadPool.GetKindConfig(const AKind: Integer; var KindCfg: TTaskKindConfig): Boolean;
+begin
+  Result := false;
+  if Self.FTaskKinds <> nil then begin
+    if Self.FTaskKinds.ContainsKey(AKind) then begin
+      KindCfg := Self.FTaskKinds[AKind];
+      Result := true;
+    end;
+  end;
 end;
 
 function TCommonThreadPool.GetMetricsByKind: TDictionary<Integer, TThreadPoolMetrics>;
@@ -1676,8 +1770,10 @@ function TCommonThreadPool._GetWorkerStats: TThreadPoolWorkerStats;
 begin
   FWorkerCS.Enter;
   try
+    Result.MinWorkers := FMinWorkers;
+    Result.MaxWorkers := FMaxWorkers;
     Result.TotalWorkers := FWorkersTotal;
-    Result.ActiveWorkers := FWorkersActive;
+    Result.BusyWorkers := FWorkersBusy;
     Result.IdleWorkers := FWorkersIdle;
     Result.BaseWorkers := FBaseCount;
     Result.QuotaWorkers := FQuotaCount;
