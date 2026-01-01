@@ -51,7 +51,13 @@ implementation
 procedure InitThreadPool;
 begin
   TMWQThreadPool.RegisterTaskKind(TASK_KIND_NONE, 'NONE', 0, 0, 0); // No rate limit, no quotas
-  TMWQThreadPool.RegisterTaskKind(TASK_KIND_SAVECACHE, 'Save cache', 2, 2, 2);
+  TMWQThreadPool.RegisterTaskKind(
+      TASK_KIND_SAVECACHE, // AKind: Integer;
+      'Save cache', //  const AName: string;
+      2, // MaxWorkers: Integer;
+      2, // RateCapacity: Int64;
+      2 //  RateRefillPerSec: Int64
+  );
   TMWQThreadPool.RegisterTaskKind(TASK_KIND_TRANSLATE, 'Translate', 4, 4, 2);
 end;
 
