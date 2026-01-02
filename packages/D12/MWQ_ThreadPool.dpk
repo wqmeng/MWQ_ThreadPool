@@ -33,6 +33,7 @@ requires
 
 contains
   MWQ.ThreadPool.Common in '..\..\src\MWQ.ThreadPool.Common.pas',
-  MWQ.ThreadPool.TaskKinds.Template in '..\..\src\MWQ.ThreadPool.TaskKinds.Template.pas';
+  MWQ.ThreadPool.TaskKinds.Template in '..\..\src\MWQ.ThreadPool.TaskKinds.Template.pas',
+  MWQ.ThreadPool.CPUUsage in '..\..\src\MWQ.ThreadPool.CPUUsage.pas';
 
 end.
