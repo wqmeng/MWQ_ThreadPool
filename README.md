@@ -145,8 +145,9 @@ begin
   end;
 
   TMWQThreadPool.EnqueueProc(
-      procedure
+      function: Boolean
       begin
+        Result := false;
         try
           try
             Inc(FJobsStarted);           
@@ -156,6 +157,7 @@ begin
                 //              Sleep(1000);
                 //              if True then begin
                 Inc(FJobsCompleted);
+                Result := true;
                 if Assigned(FOnCacheSaved) then
                   FOnCacheSaved(Job);
               end
