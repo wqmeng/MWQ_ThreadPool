@@ -157,9 +157,9 @@ begin
                 //              Sleep(1000);
                 //              if True then begin
                 Inc(FJobsCompleted);
-                Result := true;
                 if Assigned(FOnCacheSaved) then
-                  FOnCacheSaved(Job);
+                  DoOnCacheSaved(Job);
+                Result := true;
               end
               else
                 Inc(FJobsFailed);
