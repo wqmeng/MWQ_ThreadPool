@@ -7,10 +7,12 @@ uses
   System.SysUtils,
   System.SyncObjs,
   System.Generics.Collections,
-  Winapi.Windows;
+  MWQ.ThreadPool.CPUUsage;
 
 const
   PRIORITY_MAX = 7;
+  CPU_BASE_LIMIT = 75; // %
+  CPU_BURST_LIMIT = 60; // %
 
 type
   TWorkerKind = (wkBase, wkDynamic, wkBurst, wkQuota);
@@ -164,6 +166,11 @@ type
 
     FOnTaskFinished: TOnTaskFinished;
 
+    FCPU: TCPUUsageMonitor;
+    FUseCpuUsage: Boolean;
+    FCachedCpu: Single;
+    FLastCpuSampleTick: UInt64;
+
     function DequeueTask: IThreadTask;
     function GetKind(const Task: IThreadTask): Integer;
 
@@ -203,6 +210,10 @@ type
         const ARetryCount: Integer;
         const AExecTimeUs: UInt64
     );
+
+    procedure UpdateCpuUsage;
+    function CpuAllowsScaleUp(Limit: Integer): Boolean;
+    procedure SetUseCpuUsage(const Value: Boolean);
   protected
   public
     class function GetInstance: TCommonThreadPool;
@@ -250,6 +261,8 @@ type
     property BurstLimit: Integer read FBurstLimit write FBurstLimit;
     property IdleTimeoutMs: Cardinal read FIdleTimeoutMs write FIdleTimeoutMs;
     property MaxRetry: Integer read FMaxRetry write FMaxRetry;
+    property CurrentCpuUsage: Single read FCachedCpu;
+    property UseCpuUsage: Boolean read FUseCpuUsage write SetUseCpuUsage;
     {**
   FDropTaskOnThrottle:
 
@@ -343,11 +356,6 @@ begin
   Result := Min(5 + Retry * Retry * 10, 500);
 end;
 
-function GetLogicalCPUCount: Integer;
-begin
-  Result := GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-end;
-
 // ---------------------------- WORKER ----------------------------
 
 constructor TCommonThreadPool.TWorker.Create(AOwner: TCommonThreadPool);
@@ -411,7 +419,7 @@ var
   Tid: Cardinal;
   LResult: TTaskResult;
 begin
-  Tid := GetCurrentThreadId;
+  Tid := TThread.CurrentThread.ThreadID;;
   SetState(wsBusy);
 
 {$IFDEF DEBUG}
@@ -641,7 +649,7 @@ begin
     if (L.Capacity <= 0) or (L.RefillPerSec <= 0) then
       Exit; // explicitly disabled
 
-    Now := GetTickCount64;
+    Now := TThread.GetTickCount64;
     Inc(L.Tokens, ((Now - L.LastTick) * L.RefillPerSec) div 1000);
     if L.Tokens > L.Capacity then
       L.Tokens := L.Capacity;
@@ -709,13 +717,21 @@ end;
 
 procedure TCommonThreadPool.CheckScale;
 begin
+  UpdateCpuUsage;
   // Scale UP
-  if ((FQueueDepth - FQueueQuota) > FBaseCount * 2) and (FWorkersTotal < FMaxWorkers) then
+  if ((FQueueDepth - FQueueQuota) > FBaseCount * 2)
+      and (FWorkersTotal < FMaxWorkers)
+      and CpuAllowsScaleUp(CPU_BASE_LIMIT) then
     SpawnWorker;
 
   // Scale DOWN
   if (FWorkersIdle > 0) and (FWorkersTotal > FMinWorkers) then
     RetireIdleWorker;
+end;
+
+function TCommonThreadPool.CpuAllowsScaleUp(Limit: Integer): Boolean;
+begin
+  Result := (not FUseCpuUsage) or (FCachedCpu < Limit);
 end;
 
 { ================= Thread Pool ================= }
@@ -751,6 +767,8 @@ begin
   FActiveByKind := TDictionary<Integer, Integer>.Create;
   FQuotaByKind := TDictionary<Integer, Integer>.Create;
   FQuotaCS := TCriticalSection.Create;
+
+  FUseCpuUsage := false;
 
   CPU := System.CPUCount;
   if CPU < 1 then
@@ -998,6 +1016,9 @@ begin
     FMetricsCS.Leave;
   end;
   FMetricsCS.Free;
+
+  if FCPU <> nil then
+    FCPU.Free;
 
   // 5. Free rate limiters
   FRateLimiters.Free;
@@ -1499,7 +1520,7 @@ var
   NowTick: UInt64;
   Len: Integer;
 begin
-  NowTick := GetTickCount64;
+  NowTick := TThread.GetTickCount64;
 
   FWorkerCS.Enter;
   try
@@ -1607,7 +1628,7 @@ begin
     L.Capacity := Capacity;
     L.Tokens := Capacity; // start full
     L.RefillPerSec := RefillPerSec;
-    L.LastTick := GetTickCount64;
+    L.LastTick := TThread.GetTickCount64;
 
     FRateLimiters.AddOrSetValue(Kind, L);
   finally
@@ -1615,10 +1636,22 @@ begin
   end;
 end;
 
+procedure TCommonThreadPool.SetUseCpuUsage(const Value: Boolean);
+begin
+  FUseCpuUsage := Value;
+  if FUseCpuUsage and (FCPU = nil) then
+    FCPU := TCPUUsageMonitor.Create;
+end;
+
 procedure TCommonThreadPool.SpawnBurstWorker;
 var
   W: TWorker;
 begin
+  UpdateCpuUsage;
+
+  if not CpuAllowsScaleUp(CPU_BURST_LIMIT) then
+    Exit;
+
   FWorkerCS.Enter;
   try
     if FWorkersTotal >= FMaxWorkers + FBurstLimit then
@@ -1740,6 +1773,21 @@ begin
   finally
     FQuotaCS.Leave;
   end;
+end;
+
+procedure TCommonThreadPool.UpdateCpuUsage;
+const
+  CPU_SAMPLE_INTERVAL = 1000; // ms
+begin
+  if not FUseCpuUsage then
+    Exit;
+
+  if TThread.GetTickCount64 - FLastCpuSampleTick < CPU_SAMPLE_INTERVAL then
+    Exit;
+
+  FCPU.TrySample(FCachedCpu);
+
+  FLastCpuSampleTick := TThread.GetTickCount64;
 end;
 
 procedure TCommonThreadPool._CancelByOwner(Owner: UIntPtr);
