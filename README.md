@@ -145,8 +145,9 @@ begin
   end;
 
   TMWQThreadPool.EnqueueProc(
-      procedure
+      function: Boolean
       begin
+        Result := false;
         try
           try
             Inc(FJobsStarted);           
@@ -157,7 +158,8 @@ begin
                 //              if True then begin
                 Inc(FJobsCompleted);
                 if Assigned(FOnCacheSaved) then
-                  FOnCacheSaved(Job);
+                  DoOnCacheSaved(Job);
+                Result := true;
               end
               else
                 Inc(FJobsFailed);
@@ -183,7 +185,8 @@ begin
       Owner, // ATaskOwner: UIntPtr
       UIntPtr(Key), // AKey: UIntPtr
       0, // ADeadlineTick: UInt64, 0 = never expires, Example: GetTickCount64 + 120000 → task must start within 2 minutes
-      True // ACanRetry
+      True, // ACanRetry
+      nil // Context object for OnTaskFinished Event.
   );
 end;
 
