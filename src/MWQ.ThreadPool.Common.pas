@@ -125,7 +125,8 @@ type
     FTaskKinds: TDictionary<Integer, TTaskKindConfig>;
     FBurstWorkers: TArray<TWorker>;
     FWorkers: TArray<TWorker>;
-    FStop: Boolean;
+    FStopping: Boolean; // transition state
+    FStopped: Boolean; // fully stopped
 
     FQueues: array[0..PRIORITY_MAX] of TQueue<IThreadTask>;
     FQueueLocks: array[0..PRIORITY_MAX] of TCriticalSection;
@@ -214,6 +215,7 @@ type
     procedure UpdateCpuUsage;
     function CpuAllowsScaleUp(Limit: Integer): Boolean;
     procedure SetUseCpuUsage(const Value: Boolean);
+    procedure _Stop(Wait: Boolean = True);
   protected
   public
     class function GetInstance: TCommonThreadPool;
@@ -237,7 +239,8 @@ type
     ); static;
     class procedure CancelByOwner(Owner: UIntPtr); static;
     class function GetWorkerStats: TThreadPoolWorkerStats;
-
+    class procedure Stop(Wait: Boolean = True);
+    class function IsStopped: Boolean;
   public
     constructor Create(WorkerCount: Integer);
     destructor Destroy; override;
@@ -298,6 +301,7 @@ type
 **}
     property DropTaskOnThrottle: Boolean read FDropTaskOnThrottle write FDropTaskOnThrottle;
     property OnTaskFinished: TOnTaskFinished read FOnTaskFinished write FOnTaskFinished;
+    property Stopped: Boolean read FStopped;
   end;
 
   TAnonymousThreadTask = class(TInterfacedObject, IThreadTask)
@@ -426,7 +430,11 @@ begin
   Log(Format('Worker start [TID=%d Kind=%s]', [Tid, WorkerKindToStr(Self.FKind)]), etDebug);
 {$ENDIF}
 
-  while not Terminated and not FOwner.FStop do begin
+  while not Terminated do begin
+    // Fast exit on pool stop
+    if FOwner.FStopping then
+      Break;
+
     Task := nil;
 
     { STEP 1: Runnable task }
@@ -478,8 +486,13 @@ begin
 
       //      FLastActiveTick := GetTickCount64;
       SetState(wsIdle);
-      FOwner.FQueueEvent.ResetEvent;
-      FOwner.FQueueEvent.WaitFor(INFINITE);
+      if not FOwner.FStopping then begin
+        FOwner.FQueueEvent.ResetEvent;
+        FOwner.FQueueEvent.WaitFor(INFINITE);
+      end;
+      // Idle timeout exit logic (burst / dynamic workers)
+      if FOwner.FStopping then
+        Break;
       SetState(wsBusy);
       Continue;
     end;
@@ -640,6 +653,9 @@ var
   L: TKindRateLimiter;
   Now: UInt64;
 begin
+  if FStopping then
+    Exit(False);
+
   Result := True;
   FRateCS.Enter;
   try
@@ -741,6 +757,8 @@ var
   I, P: Integer;
   CPU: Integer;
 begin
+  FStopping := false;
+  FStopped := false;
   FTaskKinds := TDictionary<Integer, TTaskKindConfig>.Create;
   FQueueEvent := TEvent.Create(nil, True, False, '');
 
@@ -966,9 +984,11 @@ var
   I: Integer;
   P: PThreadPoolMetrics;
   Q: TQueue<IThreadTask>;
+  LCs: TPair<Integer, TCriticalSection>;
+  LKeys: TArray<Integer>;
 begin
   // 1. Stop workers
-  FStop := True;
+  _Stop(True); // ALWAYS wait in destructor
   FQueueEvent.SetEvent;
 
   FWorkerCS.Enter;
@@ -1035,8 +1055,15 @@ begin
   FKeyLocks.Free;
   FKeyLockCS.Free;
   FWorkerCS.Free;
+  if FQuotaQueueCS.Count > 0 then begin
+    LKeys := FQuotaQueueCS.Keys.ToArray;
 
-  inherited;
+    for I := Low(LKeys) to High(LKeys) do begin
+      LCs := FQuotaQueueCS.ExtractPair(LKeys[I]);
+      LCs.Value.Free;
+    end;
+  end;
+  FQuotaQueueCS.Free;
 end;
 
 procedure TCommonThreadPool.DoTaskFinished(
@@ -1048,6 +1075,9 @@ procedure TCommonThreadPool.DoTaskFinished(
 var
   LTask: IThreadTask;
 begin
+  if FStopping then
+    Exit;
+
   if Assigned(FOnTaskFinished) then begin
     LTask := ATask; // pin interface reference
     TThread.Queue(nil, procedure begin FOnTaskFinished(LTask, AResult, ARetryCount, AExecTimeUs); end);
@@ -1084,6 +1114,9 @@ var
   PriorityValue: Byte;
   Metrics: PThreadPoolMetrics;
 begin
+  if FStopping or FStopped then
+    Exit; // or raise exception, depending on your design
+
   if Task = nil then begin
 {$IFDEF DEBUG}
     Log('ThreadPool.Enqueue skipped: Task=nil', etDebug);
@@ -1288,6 +1321,9 @@ procedure TCommonThreadPool.EnterKey(Key: UIntPtr);
 var
   L: TLightweightMREW;
 begin
+  if FStopping then
+    Exit;
+
   FKeyLockCS.Enter;
   try
     if not FKeyLocks.TryGetValue(Key, L) then begin
@@ -1694,10 +1730,22 @@ begin
   end;
 end;
 
+class procedure TCommonThreadPool.Stop(Wait: Boolean);
+begin
+  GetInstance._Stop(Wait);
+end;
+
+class function TCommonThreadPool.IsStopped: Boolean;
+begin
+  Result := GetInstance.Stopped;
+end;
+
 function TCommonThreadPool.TryEnterKind(Kind: Integer): Boolean;
 var
   Active, Quota: Integer;
 begin
+  if FStopping then
+    Exit(false);
   Result := True;
   FQuotaCS.Enter;
   try
@@ -1863,6 +1911,44 @@ begin
   // apply runtime controls
   SetKindQuota(AKind, MaxWorkers);
   SetRateLimit(AKind, RateCapacity, RateRefillPerSec);
+end;
+
+procedure TCommonThreadPool._Stop(Wait: Boolean);
+var
+  W: TWorker;
+begin
+  if FStopping or FStopped then
+    Exit;
+
+  FStopping := True;
+
+  // 1. Wake ALL workers
+  FQueueEvent.SetEvent;
+
+  // 2. Ask workers to terminate
+  FWorkerCS.Enter;
+  try
+    for W in FWorkers do
+      W.Terminate;
+    if Length(FBurstWorkers) > 0 then begin
+      for W in FBurstWorkers do
+        W.Terminate;
+    end;
+  finally
+    FWorkerCS.Leave;
+  end;
+
+  // 3. Optionally wait
+  if Wait then begin
+    for W in FWorkers do
+      W.WaitFor;
+    if Length(FBurstWorkers) > 0 then begin
+      for W in FBurstWorkers do
+        W.WaitFor;
+    end;
+  end;
+
+  FStopped := True;
 end;
 
 initialization
