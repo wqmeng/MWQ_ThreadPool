@@ -213,3 +213,28 @@ Actively developed
 
 Open for improvements and refactoring
 
+## 🤝 Contributing
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
+
+**Additional Resources:**
+
+## 📜 License
+
+This project is licensed under the MIT - see the [LICENSE](LICENSE) file for details.
+
+## 🙏 Acknowledgments
+- All contributors to this project
+
+## 📞 Contact
+
+- **Author:** 
+- **GitHub:** [https://github.com/tixset/ImageWriter](https://github.com/wqmeng/MWQ_ThreadPool)
+
+## 🔗 Links
+
+- 
+
+---
+
+**Made with ❤️ for the open-source community**
