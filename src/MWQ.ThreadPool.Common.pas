@@ -1187,6 +1187,8 @@ begin
   PriorityValue := Task.Priority;
   if PriorityValue > PRIORITY_MAX then
     P := PRIORITY_MAX
+  else if PriorityValue < 0 then
+    P := 0
   else
     P := PriorityValue;
 
