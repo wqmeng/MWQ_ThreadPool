@@ -1,5 +1,20 @@
 # MWQ_ThreadPool
 
+[![License: GPL v3](https://img.shields.io/badge/License-MIT-blue.svg)](https://mit-license.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows-0078d4.svg)](https://www.microsoft.com/windows)
+[![Language](https://img.shields.io/badge/Language-Delphi%2012-ee1f35.svg)](https://www.embarcadero.com/products/delphi)
+![GitHub Release](https://img.shields.io/github/v/release/wqmeng/MWQ_ThreadPool)
+[![Status](https://img.shields.io/badge/Status-Active-success.svg)](https://github.com/wqmeng/MWQ_ThreadPool)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
+[![GitHub Stars](https://img.shields.io/github/stars/wqmeng/MWQ_ThreadPool?style=social)](https://github.com/wqmeng/MWQ_ThreadPool/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/wqmeng/MWQ_ThreadPool?style=social)](https://github.com/wqmeng/MWQ_ThreadPool/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/wqmeng/MWQ_ThreadPool)](https://github.com/wqmeng/MWQ_ThreadPool/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/wqmeng/MWQ_ThreadPool)](https://github.com/wqmeng/MWQ_ThreadPool/commits)
+[![Code Size](https://img.shields.io/github/languages/code-size/wqmeng/MWQ_ThreadPool)](https://github.com/wqmeng/MWQ_ThreadPool)
+
+[![English](https://img.shields.io/badge/lang-English-blue.svg)](docs/README.md)
+
 **MWQ_ThreadPool** is a high-performance, production-oriented thread pool implementation for **Delphi / Object Pascal**, designed for **server-side**, **data-pipeline**, and **event-driven** workloads.
 
 It focuses on **fair scheduling**, **quota control**, **rate limiting**, and **robust task lifecycle management**, making it suitable for systems such as:
@@ -229,7 +244,7 @@ This project is licensed under the MIT - see the [LICENSE](LICENSE) file for det
 ## 📞 Contact
 
 - **Author:** 
-- **GitHub:** [https://github.com/tixset/ImageWriter](https://github.com/wqmeng/MWQ_ThreadPool)
+- **GitHub:** [MWQ_ThreadPool](https://github.com/wqmeng/MWQ_ThreadPool)]
 
 ## 🔗 Links
 
