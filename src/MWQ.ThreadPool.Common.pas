@@ -97,6 +97,7 @@ type
           const ARetryCount: Integer;
           const AExecTimeUs: UInt64
       ) of object;
+  TOnTaskExcept = procedure(Sender: TObject; const ATask: IThreadTask) of object;
 
   TCommonThreadPool = class
   private
@@ -171,6 +172,7 @@ type
     FUseCpuUsage: Boolean;
     FCachedCpu: Single;
     FLastCpuSampleTick: UInt64;
+    FOnTaskExcept: TOnTaskExcept;
 
     function DequeueTask: IThreadTask;
     function GetKind(const Task: IThreadTask): Integer;
@@ -211,6 +213,7 @@ type
         const ARetryCount: Integer;
         const AExecTimeUs: UInt64
     );
+    procedure DoTaskExcept(const ATask: IThreadTask);
 
     procedure UpdateCpuUsage;
     function CpuAllowsScaleUp(Limit: Integer): Boolean;
@@ -300,8 +303,9 @@ type
   Default: FALSE
 **}
     property DropTaskOnThrottle: Boolean read FDropTaskOnThrottle write FDropTaskOnThrottle;
-    property OnTaskFinished: TOnTaskFinished read FOnTaskFinished write FOnTaskFinished;
     property Stopped: Boolean read FStopped;
+    property OnTaskFinished: TOnTaskFinished read FOnTaskFinished write FOnTaskFinished;
+    property OnTaskExcept: TOnTaskExcept read FOnTaskExcept write FOnTaskExcept;
   end;
 
   TAnonymousThreadTask = class(TInterfacedObject, IThreadTask)
@@ -576,7 +580,15 @@ begin
       FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].Started);
 
       while True do begin
-        Task.Run;
+        try
+          Task.Run;
+        except
+          on E: Exception do begin
+            LResult := TTaskResult.trFailed;
+            FOwner.DoTaskExcept(Task);
+            break; // exit current task
+          end;
+        end;
 
         if Task.TaskDone then begin
           if Task.IsCancelled then
@@ -938,6 +950,7 @@ begin
     on E: Exception do begin
       FSuccess := False;
       // store E.Message if needed
+      raise E;
     end;
   end;
 end;
@@ -1066,6 +1079,28 @@ begin
   FQuotaQueueCS.Free;
 end;
 
+procedure TCommonThreadPool.DoTaskExcept(const ATask: IThreadTask);
+var
+  LTask: IThreadTask;
+begin
+  if FStopping then
+    Exit;
+
+  if Assigned(FOnTaskExcept) then begin
+    LTask := ATask;
+
+    TThread.Queue(
+        nil,
+        procedure
+        begin
+          if FStopping then
+            Exit;
+          FOnTaskExcept(Self, LTask);
+        end
+    );
+  end;
+end;
+
 procedure TCommonThreadPool.DoTaskFinished(
     const ATask: IThreadTask;
     const AResult: TTaskResult;
@@ -1080,7 +1115,15 @@ begin
 
   if Assigned(FOnTaskFinished) then begin
     LTask := ATask; // pin interface reference
-    TThread.Queue(nil, procedure begin FOnTaskFinished(LTask, AResult, ARetryCount, AExecTimeUs); end);
+    TThread.Queue(
+        nil,
+        procedure
+        begin
+          if FStopping then
+            Exit;
+          FOnTaskFinished(LTask, AResult, ARetryCount, AExecTimeUs);
+        end
+    );
   end;
 end;
 
