@@ -199,7 +199,8 @@ begin
       TASK_KIND_SAVECACHE, // AKind
       Owner, // ATaskOwner: UIntPtr
       UIntPtr(Key), // AKey: UIntPtr
-      0, // ADeadlineTick: UInt64, 0 = never expires, Example: GetTickCount64 + 120000 → task must start within 2 minutes
+      0, // ADeadlineTick: UInt64, 0 = never expires,
+         // Example: GetTickCount64 + 120000 → task must start within 2 minutes or it will be dropped.
       True, // ACanRetry
       nil // Context object for OnTaskFinished Event.
   );
@@ -244,7 +245,7 @@ This project is licensed under the MIT - see the [LICENSE](LICENSE) file for det
 ## 📞 Contact
 
 - **Author:** 
-- **GitHub:** [MWQ_ThreadPool](https://github.com/wqmeng/MWQ_ThreadPool)]
+- **GitHub:** [MWQ_ThreadPool](https://github.com/wqmeng/MWQ_ThreadPool)
 
 ## 🔗 Links
 
