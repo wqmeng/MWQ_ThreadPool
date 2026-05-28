@@ -1,4 +1,4 @@
-ï»¿unit MWQ.ThreadPool.Common;
+unit MWQ.ThreadPool.Common;
 
 interface
 
@@ -86,7 +86,7 @@ type
   TKindRateLimiter = record
     Capacity: Int64;
     Tokens: Int64;
-    RefillPerSec: Int64;
+    RefillPerSec: UInt64;
     LastTick: UInt64;
   end;
 
@@ -97,6 +97,7 @@ type
           const ARetryCount: Integer;
           const AExecTimeUs: UInt64
       ) of object;
+
   TOnTaskExcept = procedure(Sender: TObject; const ATask: IThreadTask) of object;
 
   TCommonThreadPool = class
@@ -289,11 +290,11 @@ type
     - Use ONLY for best-effort, fire-and-forget workloads
       (e.g. telemetry, statistics sampling, debug logging).
 
-  âš  WARNING:
+  WARNING:
     Enabling this flag changes throttling into dropping.
     This can look like worker starvation or deadlock during debugging.
 
-  âš  NEVER enable this for:
+  NEVER enable this for:
     - Financial transactions
     - Database writes
     - Message delivery
@@ -313,9 +314,9 @@ type
     FSuccess: Boolean;
     FFunc: TFunc<Boolean>;
     FPriority: Byte;
-    FKey: UIntPtr;
     FKind: Integer;
-    FOwner: Integer;
+    FKey: UIntPtr;
+    FOwner: UIntPtr;
     FCanceled: Boolean;
     FCanRetry: Boolean;
     FDone: Boolean;
@@ -529,7 +530,7 @@ begin
     //      FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].Throttled);
     //
     // {$IFDEF DEBUG}
-    //      Log(Format('Rate limited â†’ requeue [TID=%d Kind=%d Key=%x]', [GetCurrentThreadId, Kind, Task.Key]), etDebug);
+    //      Log(Format('Rate limited ¡ú requeue [TID=%d Kind=%d Key=%x]', [GetCurrentThreadId, Kind, Task.Key]), etDebug);
     // {$ENDIF}
     //
     //      FOwner.Enqueue(Task, True);
@@ -541,7 +542,7 @@ begin
     if (Self.FKind = wkQuota) or FOwner.HasKindQuota(Kind) then begin
       if not FOwner.TryEnterKind(Kind) then begin
 {$IFDEF DEBUG}
-        Log(Format('Quota denied â†’ requeue [TID=%d Kind=%d Key=%x]', [Tid, Kind, Task.Key]), etDebug);
+        Log(Format('Quota denied ¡ú requeue [TID=%d Kind=%d Key=%x]', [Tid, Kind, Task.Key]), etDebug);
 {$ENDIF}
 
         FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].QuotaDenied);
@@ -554,7 +555,7 @@ begin
           Inc(FOwner.FBaseCount);
         end;
 
-        Continue; // âœ… IMPORTANT: continue, never break
+        Continue; // ? IMPORTANT: continue, never break
       end;
 
       // Deal Quota, Change from wkBase to wkQuota;
@@ -857,7 +858,7 @@ begin
       if FQueues[P].Count > 0 then begin
         Result := FQueues[P].Dequeue;
         Kind := GetKind(Result);
-        IncMetric(Kind, FMetrics[Kind].QueueDepth, -1); // âœ… FIX
+        IncMetric(Kind, FMetrics[Kind].QueueDepth, -1); // FIX
         Exit;
       end;
     finally
@@ -879,7 +880,7 @@ begin
       if FQueues[P].Count > 0 then begin
         Result := FQueues[P].Dequeue;
         Kind := GetKind(Result);
-        IncMetric(Kind, FMetrics[Kind].QueueDepth, -1); // âœ… FIX
+        IncMetric(Kind, FMetrics[Kind].QueueDepth, -1); // FIX
         Exit;
       end;
     finally
@@ -949,8 +950,9 @@ begin
   except
     on E: Exception do begin
       FSuccess := False;
-      // store E.Message if needed
-      raise E;
+      FSuccess := FFunc();
+      // Preserve Delphi's current exception object ownership and stack.
+      raise;
     end;
   end;
 end;
@@ -1029,7 +1031,7 @@ begin
     FQueueLocks[I].Free;
   end;
 
-  // 3. Free quota queues (ðŸ”´ MISSING ENTIRELY)
+  // 3. Free quota queues (MISSING ENTIRELY)
   FQuotaCS.Enter;
   try
     for Q in FQuotaQueues.Values do
@@ -1829,7 +1831,7 @@ begin
       if not FActiveByKind.TryGetValue(Kind, Active) then
         Active := 0;
 
-      // quota full â†’ skip
+      // quota full ¡ú skip
       if Active >= Quota then
         Continue;
 
