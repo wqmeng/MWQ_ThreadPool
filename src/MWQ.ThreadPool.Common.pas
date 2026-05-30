@@ -64,9 +64,12 @@ type
     Throttled: Int64;
     QuotaDenied: Int64;
     Expired: Int64;
-    QueueDepth: Int64; // FIXED: tasks still in queue
     Requeued: Int64;
-    QuotaQueue: Int64;
+
+    RunnableQueue: Integer; // Normal
+    QuotaQueue: Int64; // Quota
+    QueueDepth: Int64; // Total
+
     ExecTimeUsTotal: Int64;
   end;
 
@@ -112,6 +115,7 @@ type
         FOwner: TCommonThreadPool;
         FState: TWorkerState;
         FKind: TWorkerKind;
+        FTaskKind: Integer;
         FLastActiveTick: UInt64;
         procedure SetState(AState: TWorkerState);
       protected
@@ -422,11 +426,11 @@ end;
 procedure TCommonThreadPool.TWorker.Execute;
 var
   Task: IThreadTask;
-  Kind: Integer;
   LRetry: Integer;
   StartTick, Latency: UInt64;
   Tid: Cardinal;
   LResult: TTaskResult;
+  Kind: Integer;
 begin
   Tid := TThread.CurrentThread.ThreadID;;
   SetState(wsBusy);
@@ -460,7 +464,8 @@ begin
     { STEP 2: Quota task }
     if Task = nil then begin
       if Self.FKind = wkQuota then
-        Task := FOwner.TryTakeQuotaTaskByKind(Kind)
+        //        Task := FOwner.TryTakeQuotaTaskByKind(Kind)
+        Task := FOwner.TryTakeQuotaTaskByKind(FTaskKind)
       else
         Task := FOwner.TryTakeQuotaTaskAny;
 
@@ -477,8 +482,33 @@ begin
 
         if Self.FKind = wkBase then begin
           Self.FKind := wkQuota;
+          Self.FTaskKind := Task.Kind;
           Inc(FOwner.FQuotaCount);
           Dec(FOwner.FBaseCount);
+        end;
+      end
+      else begin
+{$IFDEF DEBUG}
+        if (Self.FKind = wkQuota) and (Task = nil) then begin
+          var LM := FOwner.GetMetricsSummary;
+
+          Log(Format('[QUOTA EMPTY] TID=%d TaskKind=%d RunnableDepth=%d', [Tid, FTaskKind, LM.QueueDepth]), etDebug);
+        end;
+{$ENDIF}
+
+        if (Self.FKind = wkQuota) then begin
+          Task := FOwner.TryTakeQuotaTaskAny;
+
+          if Task <> nil then begin
+            Self.FTaskKind := Task.Kind;
+          end
+          else begin
+            Task := FOwner.DequeueRunnableTask;
+            //            Self.FKind := wkBase;
+            //            Self.FTaskKind := -1;
+            //            Dec(FOwner.FQuotaCount);
+            //            Inc(FOwner.FBaseCount);
+          end;
         end;
       end;
     end;
@@ -487,6 +517,8 @@ begin
     if Task = nil then begin
 {$IFDEF DEBUG}
       Log(Format('Worker idle wait [TID=%d]', [Tid]), etDebug);
+
+      Log(Format('[SLEEP] TID=%d', [TThread.Current.ThreadID]), etDebug);
 {$ENDIF}
 
       //      FLastActiveTick := GetTickCount64;
@@ -495,6 +527,11 @@ begin
         FOwner.FQueueEvent.ResetEvent;
         FOwner.FQueueEvent.WaitFor(INFINITE);
       end;
+
+{$IFDEF DEBUG}
+      Log(Format('[WAKE] TID=%d', [TThread.Current.ThreadID]), etDebug);
+{$ENDIF}
+
       // Idle timeout exit logic (burst / dynamic workers)
       if FOwner.FStopping then
         Break;
@@ -551,6 +588,7 @@ begin
         // Quota Full. Change from wkQuota to wkBase;
         if Self.FKind = wkQuota then begin
           Self.FKind := wkBase;
+          Self.FTaskKind := -1;
           Dec(FOwner.FQuotaCount);
           Inc(FOwner.FBaseCount);
         end;
@@ -561,6 +599,7 @@ begin
       // Deal Quota, Change from wkBase to wkQuota;
       if Self.FKind = wkBase then begin
         Self.FKind := wkQuota;
+        Self.FTaskKind := Kind;
         Inc(FOwner.FQuotaCount);
         Dec(FOwner.FBaseCount);
       end;
@@ -625,8 +664,14 @@ begin
       if Self.FKind = wkQuota then begin
         FOwner.LeaveKind(Kind);
 
-        if FOwner.FWorkersIdle <= 0 then begin // When FWorkersIdle = 0, Try Next task from runnable queue firstly.
+        if FOwner.FWorkersIdle <= 0 then begin
+          // No idle workers available.
+          // Return this worker to the global scheduler so that
+          // high-priority runnable tasks are not starved by
+          // quota-only processing.
+
           Self.FKind := wkBase;
+          Self.FTaskKind := -1;
           Dec(FOwner.FQuotaCount);
           Inc(FOwner.FBaseCount);
         end;
@@ -1332,6 +1377,11 @@ begin
   finally
     FQuotaCS.Leave;
   end;
+{$IFDEF DEBUG}
+  Log(Format('[Q-IN] Kind=%d Key=%x QCount=%d', [Task.Kind, Task.Key, Q.Count]), etDebug);
+{$ENDIF}
+
+  FQueueEvent.SetEvent;
 end;
 
 procedure TCommonThreadPool.EnqueueRunnableTask(const Task: IThreadTask);
@@ -1463,19 +1513,24 @@ begin
   // -----------------------------
   // Runnable queue depth
   // -----------------------------
+  Result.RunnableQueue := 0;
   Result.QueueDepth := 0;
-  for I := Low(FQueues) to High(FQueues) do
+
+  for I := Low(FQueues) to High(FQueues) do begin
+    Inc(Result.RunnableQueue, FQueues[I].Count);
     Inc(Result.QueueDepth, FQueues[I].Count);
+  end;
 
   // -----------------------------
   // Quota queue depth
   // -----------------------------
   Result.QuotaQueue := 0;
+
   FQuotaCS.Enter;
   try
     for Pair in FQuotaQueues do begin
       Inc(Result.QuotaQueue, Pair.Value.Count);
-      Inc(Result.QueueDepth, Pair.Value.Count); // important!
+      Inc(Result.QueueDepth, Pair.Value.Count);
     end;
   finally
     FQuotaCS.Leave;
@@ -1541,7 +1596,10 @@ begin
       V := 0;
 
     FActiveByKind[Kind] := V;
-
+{$IFDEF DEBUG}
+    Log(Format('[LEAVE] Kind=%d Active=%d->%d', [Kind, V + 1, V]), etDebug);
+{$ENDIF}
+    //    FQueueEvent.SetEvent;
   finally
     FQuotaCS.Leave;
   end;
@@ -1742,6 +1800,7 @@ begin
 
     W := TWorker.Create(Self);
     W.FKind := wkBurst;
+    W.FTaskKind := -1;
     Inc(FWorkersTotal);
     Inc(FWorkersBurst);
 
@@ -1800,10 +1859,17 @@ begin
       Exit;
 
     Active := FActiveByKind[Kind];
-    if Active >= Quota then
+    if Active >= Quota then begin
+{$IFDEF DEBUG}
+      Log(Format('[ENTER  Active >= Quota false] Kind=%d Active=%d->%d', [Kind, Active, Active + 1]), etDebug);
+{$ENDIF}
       Exit(False);
+    end;
 
     FActiveByKind[Kind] := Active + 1;
+{$IFDEF DEBUG}
+    Log(Format('[ENTER true] Kind=%d Active=%d->%d', [Kind, Active, Active + 1]), etDebug);
+{$ENDIF}
   finally
     FQuotaCS.Leave;
   end;
@@ -1814,6 +1880,9 @@ var
   Pair: TPair<Integer, TQueue<IThreadTask>>;
   Kind, Active, Quota: Integer;
 begin
+{$IFDEF DEBUG}
+  Log(Format('[TRY-QUOTA] WorkersIdle=%d QuotaQueues=%d', [FWorkersIdle, FQuotaQueues.Count]), etDebug);
+{$ENDIF}
   Result := nil;
 
   // Only inspect quota state here
@@ -1837,6 +1906,15 @@ begin
 
       // Take the task atomically
       Result := Pair.Value.Dequeue;
+{$IFDEF DEBUG}
+      Log(
+          Format(
+              '[Q-OUT] Kind=%d Key=%x Active=%d Quota=%d Remain=%d',
+              [Result.Kind, Result.Key, Active, Quota, Pair.Value.Count]
+          ),
+          etDebug
+      );
+{$ENDIF}
       Exit;
     end;
   finally
@@ -1861,10 +1939,10 @@ begin
       Result := Q.Dequeue;
 
     // Optional: remove empty queue
-    if Q.Count = 0 then begin
-      FQuotaQueues.Remove(Kind);
-      Q.Free;
-    end;
+    //    if Q.Count = 0 then begin
+    //      FQuotaQueues.Remove(Kind);
+    //      Q.Free;
+    //    end;
   finally
     FQuotaCS.Leave;
   end;
