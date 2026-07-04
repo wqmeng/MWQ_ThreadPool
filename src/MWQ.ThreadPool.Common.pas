@@ -1,4 +1,4 @@
-unit MWQ.ThreadPool.Common;
+ï»¿unit MWQ.ThreadPool.Common;
 
 interface
 
@@ -107,6 +107,7 @@ type
   private
     class var
       FInstance: TCommonThreadPool;
+      FGlobalStopping: Integer;
 
   private
     type
@@ -133,6 +134,7 @@ type
     FWorkers: TArray<TWorker>;
     FStopping: Boolean; // transition state
     FStopped: Boolean; // fully stopped
+    FAcceptingStopped: Boolean; // reject new work while existing work drains
 
     FQueues: array[0..PRIORITY_MAX] of TQueue<IThreadTask>;
     FQueueLocks: array[0..PRIORITY_MAX] of TCriticalSection;
@@ -203,8 +205,8 @@ type
     procedure EnqueueRunnableTask(const Task: IThreadTask);
     function DequeueRunnableTask: IThreadTask;
     function DequeueRunnableTaskMinPriority(MinPriority: Integer): IThreadTask;
-    function TryTakeQuotaTaskAny: IThreadTask;
-    function TryTakeQuotaTaskByKind(Kind: Integer): IThreadTask;
+    function TryTakeQuotaTaskAny(out AReservedKind: Integer): IThreadTask;
+    function TryTakeQuotaTaskByKind(Kind: Integer; out AReservedKind: Integer): IThreadTask;
     procedure EnqueueQuotaTask(const Task: IThreadTask);
     procedure OnBurstWorkerExit(Worker: TWorker);
     function HasKindQuota(Kind: Integer): Boolean;
@@ -247,8 +249,11 @@ type
     ); static;
     class procedure CancelByOwner(Owner: UIntPtr); static;
     class function GetWorkerStats: TThreadPoolWorkerStats;
+    class procedure StopAccepting;
     class procedure Stop(Wait: Boolean = True);
     class function IsStopped: Boolean;
+    class function GetTaskKindName(AKind: Integer): string;
+    class function GetTaskKindConfig(AKind: Integer; out Cfg: TTaskKindConfig): Boolean;
   public
     constructor Create(WorkerCount: Integer);
     destructor Destroy; override;
@@ -263,7 +268,7 @@ type
     procedure AddMetrics(var Dst: TThreadPoolMetrics; const Src: TThreadPoolMetrics);
     function GetMetricsSummary: TThreadPoolMetrics;
     function GetMetricsByKind: TDictionary<Integer, TThreadPoolMetrics>;
-    function GetKindConfig(const AKind: Integer; var KindCfg: TTaskKindConfig): Boolean;
+    function GetKindConfig(const AKind: Integer; out KindCfg: TTaskKindConfig): Boolean;
     function GetMetricsForKind(Kind: Integer; out Metrics: TThreadPoolMetrics): Boolean;
     function AvgExecTimeUs(const M: TThreadPoolMetrics): Double;
     function DumpThreadPoolStats: string;
@@ -431,6 +436,8 @@ var
   Tid: Cardinal;
   LResult: TTaskResult;
   Kind: Integer;
+  LQuotaEntered: Boolean;
+  LReservedKind: Integer;
 begin
   Tid := TThread.CurrentThread.ThreadID;;
   SetState(wsBusy);
@@ -445,6 +452,8 @@ begin
       Break;
 
     Task := nil;
+    LQuotaEntered := False;
+    LReservedKind := -1;
 
     { STEP 1: Runnable task }
     if Self.FKind <> wkQuota then begin
@@ -465,12 +474,13 @@ begin
     if Task = nil then begin
       if Self.FKind = wkQuota then
         //        Task := FOwner.TryTakeQuotaTaskByKind(Kind)
-        Task := FOwner.TryTakeQuotaTaskByKind(FTaskKind)
+        Task := FOwner.TryTakeQuotaTaskByKind(FTaskKind, LReservedKind)
       else
-        Task := FOwner.TryTakeQuotaTaskAny;
+        Task := FOwner.TryTakeQuotaTaskAny(LReservedKind);
 
       if Task <> nil then begin
-{$IFDEF DEBUG}
+        LQuotaEntered := LReservedKind >= 0;
+{$IFDEF THREADPOOL_VERBOSE_LOG}
         Log(
             Format(
                 'Worker took quota task [TID=%d Worker=%s Kind=%d Key=%x]',
@@ -488,7 +498,7 @@ begin
         end;
       end
       else begin
-{$IFDEF DEBUG}
+{$IFDEF THREADPOOL_VERBOSE_LOG}
         if (Self.FKind = wkQuota) and (Task = nil) then begin
           var LM := FOwner.GetMetricsSummary;
 
@@ -497,9 +507,10 @@ begin
 {$ENDIF}
 
         if (Self.FKind = wkQuota) then begin
-          Task := FOwner.TryTakeQuotaTaskAny;
+          Task := FOwner.TryTakeQuotaTaskAny(LReservedKind);
 
           if Task <> nil then begin
+            LQuotaEntered := LReservedKind >= 0;
             Self.FTaskKind := Task.Kind;
           end
           else begin
@@ -515,7 +526,7 @@ begin
 
     { STEP 3: Wait }
     if Task = nil then begin
-{$IFDEF DEBUG}
+{$IFDEF THREADPOOL_VERBOSE_LOG}
       Log(Format('Worker idle wait [TID=%d]', [Tid]), etDebug);
 
       Log(Format('[SLEEP] TID=%d', [TThread.Current.ThreadID]), etDebug);
@@ -525,10 +536,11 @@ begin
       SetState(wsIdle);
       if not FOwner.FStopping then begin
         FOwner.FQueueEvent.ResetEvent;
-        FOwner.FQueueEvent.WaitFor(INFINITE);
+        if not FOwner.FStopping then
+          FOwner.FQueueEvent.WaitFor(250);
       end;
 
-{$IFDEF DEBUG}
+{$IFDEF THREADPOOL_VERBOSE_LOG}
       Log(Format('[WAKE] TID=%d', [TThread.Current.ThreadID]), etDebug);
 {$ENDIF}
 
@@ -541,9 +553,13 @@ begin
 
     { STEP 4: Cancelled }
     if Task.IsCancelled then begin
-{$IFDEF DEBUG}
+{$IFDEF THREADPOOL_VERBOSE_LOG}
       Log(Format('Task cancelled skip [TID=%d Kind=%d Key=%x]', [Tid, Task.Kind, Task.Key]), etDebug);
 {$ENDIF}
+      if LQuotaEntered then begin
+        FOwner.LeaveKind(Task.Kind);
+        LQuotaEntered := False;
+      end;
       FOwner.DoTaskFinished(Task, TTaskResult.trCanceled, 0, 0);
       Continue;
     end;
@@ -552,11 +568,15 @@ begin
 
     { STEP 5: Deadline }
     if (Task.DeadlineTick > 0) and (GetTickCount64 > Task.DeadlineTick) then begin
-{$IFDEF DEBUG}
+{$IFDEF THREADPOOL_VERBOSE_LOG}
       Log(Format('Task expired [TID=%d Kind=%d Key=%x]', [Tid, Kind, Task.Key]), etDebug);
 {$ENDIF}
 
       Task.Cancel;
+      if LQuotaEntered then begin
+        FOwner.LeaveKind(Kind);
+        LQuotaEntered := False;
+      end;
       FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].Expired);
       FOwner.DoTaskFinished(Task, TTaskResult.trCanceled, 0, 0);
       Continue;
@@ -567,7 +587,7 @@ begin
     //      FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].Throttled);
     //
     // {$IFDEF DEBUG}
-    //      Log(Format('Rate limited ¡ú requeue [TID=%d Kind=%d Key=%x]', [GetCurrentThreadId, Kind, Task.Key]), etDebug);
+    //      Log(Format('Rate limited â†’ requeue [TID=%d Kind=%d Key=%x]', [GetCurrentThreadId, Kind, Task.Key]), etDebug);
     // {$ENDIF}
     //
     //      FOwner.Enqueue(Task, True);
@@ -577,9 +597,9 @@ begin
 
     { STEP 6: Quota }
     if (Self.FKind = wkQuota) or FOwner.HasKindQuota(Kind) then begin
-      if not FOwner.TryEnterKind(Kind) then begin
-{$IFDEF DEBUG}
-        Log(Format('Quota denied ¡ú requeue [TID=%d Kind=%d Key=%x]', [Tid, Kind, Task.Key]), etDebug);
+      if (not LQuotaEntered) and (not FOwner.TryEnterKind(Kind)) then begin
+{$IFDEF THREADPOOL_VERBOSE_LOG}
+        Log(Format('Quota denied â†’ requeue [TID=%d Kind=%d Key=%x]', [Tid, Kind, Task.Key]), etInfo);
 {$ENDIF}
 
         FOwner.IncMetric(Kind, FOwner.FMetrics[Kind].QuotaDenied);
@@ -596,6 +616,8 @@ begin
         Continue; // ? IMPORTANT: continue, never break
       end;
 
+      LQuotaEntered := True;
+
       // Deal Quota, Change from wkBase to wkQuota;
       if Self.FKind = wkBase then begin
         Self.FKind := wkQuota;
@@ -606,7 +628,7 @@ begin
     end;
 
     { STEP 7: Execute }
-{$IFDEF DEBUG}
+{$IFDEF THREADPOOL_VERBOSE_LOG}
     Log(
         Format('Execute task [TID=%d Worker=%s Kind=%d Key=%x]', [Tid, WorkerKindToStr(Self.FKind), Kind, Task.Key]),
         etDebug
@@ -661,9 +683,12 @@ begin
       Task.Cleanup;
       FOwner.LeaveKey(Task.Key);
 
-      if Self.FKind = wkQuota then begin
+      if LQuotaEntered then begin
         FOwner.LeaveKind(Kind);
+        LQuotaEntered := False;
+      end;
 
+      if Self.FKind = wkQuota then begin
         if FOwner.FWorkersIdle <= 0 then begin
           // No idle workers available.
           // Return this worker to the global scheduler so that
@@ -712,6 +737,8 @@ var
   Now: UInt64;
 begin
   if FStopping then
+    Exit(False);
+  if FAcceptingStopped then
     Exit(False);
 
   Result := True;
@@ -785,8 +812,12 @@ begin
 end;
 
 class procedure TCommonThreadPool.CancelByOwner(Owner: UIntPtr);
+var
+  LPool: TCommonThreadPool;
 begin
-  GetInstance._CancelByOwner(Owner);
+  LPool := GetInstance;
+  if LPool <> nil then
+    LPool._CancelByOwner(Owner);
 end;
 
 procedure TCommonThreadPool.CheckScale;
@@ -817,6 +848,7 @@ var
 begin
   FStopping := false;
   FStopped := false;
+  FAcceptingStopped := false;
   FTaskKinds := TDictionary<Integer, TTaskKindConfig>.Create;
   FQueueEvent := TEvent.Create(nil, True, False, '');
 
@@ -1204,7 +1236,7 @@ var
   PriorityValue: Byte;
   Metrics: PThreadPoolMetrics;
 begin
-  if FStopping or FStopped then
+  if FAcceptingStopped or FStopping or FStopped then
     Exit; // or raise exception, depending on your design
 
   if Task = nil then begin
@@ -1277,8 +1309,6 @@ begin
   PriorityValue := Task.Priority;
   if PriorityValue > PRIORITY_MAX then
     P := PRIORITY_MAX
-  else if PriorityValue < 0 then
-    P := 0
   else
     P := PriorityValue;
 
@@ -1377,8 +1407,8 @@ begin
   finally
     FQuotaCS.Leave;
   end;
-{$IFDEF DEBUG}
-  Log(Format('[Q-IN] Kind=%d Key=%x QCount=%d', [Task.Kind, Task.Key, Q.Count]), etDebug);
+{$IFDEF THREADPOOL_VERBOSE_LOG}
+  Log(Format('[Q-IN] Kind=%d Key=%x QCount=%d', [Task.Kind, Task.Key, Q.Count]), etInfo);
 {$ENDIF}
 
   FQueueEvent.SetEvent;
@@ -1410,8 +1440,12 @@ begin
 end;
 
 class procedure TCommonThreadPool.EnqueueTask(const Task: IThreadTask);
+var
+  LPool: TCommonThreadPool;
 begin
-  GetInstance.Enqueue(Task);
+  LPool := GetInstance;
+  if LPool <> nil then
+    LPool.Enqueue(Task);
 end;
 
 procedure TCommonThreadPool.EnterKey(Key: UIntPtr);
@@ -1435,6 +1469,11 @@ end;
 
 class function TCommonThreadPool.GetInstance: TCommonThreadPool;
 begin
+  if TInterlocked.CompareExchange(FGlobalStopping, 0, 0) <> 0 then begin
+    Result := nil;
+    Exit;
+  end;
+
   if not Assigned(TCommonThreadPool.FInstance) then
     TCommonThreadPool.FInstance := TCommonThreadPool.Create(4); // default 4 workers
 
@@ -1446,15 +1485,9 @@ begin
   Result := Task.Kind
 end;
 
-function TCommonThreadPool.GetKindConfig(const AKind: Integer; var KindCfg: TTaskKindConfig): Boolean;
+function TCommonThreadPool.GetKindConfig(const AKind: Integer; out KindCfg: TTaskKindConfig): Boolean;
 begin
-  Result := false;
-  if Self.FTaskKinds <> nil then begin
-    if Self.FTaskKinds.ContainsKey(AKind) then begin
-      KindCfg := Self.FTaskKinds[AKind];
-      Result := true;
-    end;
-  end;
+  Result := Assigned(FTaskKinds) and FTaskKinds.TryGetValue(AKind, KindCfg);
 end;
 
 function TCommonThreadPool.GetMetricsByKind: TDictionary<Integer, TThreadPoolMetrics>;
@@ -1537,9 +1570,32 @@ begin
   end;
 end;
 
-class function TCommonThreadPool.GetWorkerStats: TThreadPoolWorkerStats;
+class function TCommonThreadPool.GetTaskKindConfig(AKind: Integer; out Cfg: TTaskKindConfig): Boolean;
+var
+  LPool: TCommonThreadPool;
 begin
-  Result := GetInstance._GetWorkerStats;
+  LPool := GetInstance;
+  Result := (LPool <> nil) and LPool.GetKindConfig(AKind, Cfg);
+end;
+
+class function TCommonThreadPool.GetTaskKindName(AKind: Integer): string;
+var
+  Cfg: TTaskKindConfig;
+begin
+  if GetTaskKindConfig(AKind, Cfg) then
+    Result := Cfg.Name
+  else
+    Result := Format('Kind(%d)', [AKind]);
+end;
+
+class function TCommonThreadPool.GetWorkerStats: TThreadPoolWorkerStats;
+var
+  LPool: TCommonThreadPool;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  LPool := GetInstance;
+  if LPool <> nil then
+    Result := LPool._GetWorkerStats;
 end;
 
 function TCommonThreadPool.HasKindQuota(Kind: Integer): Boolean;
@@ -1585,7 +1641,11 @@ end;
 procedure TCommonThreadPool.LeaveKind(Kind: Integer);
 var
   V: Integer;
+  Q: TQueue<IThreadTask>;
+  LShouldWake: Boolean;
 begin
+  LShouldWake := False;
+
   FQuotaCS.Enter;
   try
     if not FActiveByKind.TryGetValue(Kind, V) then
@@ -1596,13 +1656,16 @@ begin
       V := 0;
 
     FActiveByKind[Kind] := V;
+    LShouldWake := FQuotaQueues.TryGetValue(Kind, Q) and (Q.Count > 0);
 {$IFDEF DEBUG}
     Log(Format('[LEAVE] Kind=%d Active=%d->%d', [Kind, V + 1, V]), etDebug);
 {$ENDIF}
-    //    FQueueEvent.SetEvent;
   finally
     FQuotaCS.Leave;
   end;
+
+  if LShouldWake and (not FStopping) then
+    FQueueEvent.SetEvent;
 end;
 
 function TCommonThreadPool.MetricsSnapshot: TDictionary<Integer, PThreadPoolMetrics>;
@@ -1649,9 +1712,11 @@ class procedure TCommonThreadPool.RegisterTaskKind(
     RateCapacity, RateRefillPerSec: Int64
 );
 var
-  Cfg: TTaskKindConfig;
+  LPool: TCommonThreadPool;
 begin
-  GetInstance._RegisterTaskKind(AKind, AName, MaxWorkers, RateCapacity, RateRefillPerSec);
+  LPool := GetInstance;
+  if LPool <> nil then
+    LPool._RegisterTaskKind(AKind, AName, MaxWorkers, RateCapacity, RateRefillPerSec);
 end;
 
 procedure TCommonThreadPool.RetireIdleWorker;
@@ -1838,12 +1903,24 @@ end;
 
 class procedure TCommonThreadPool.Stop(Wait: Boolean);
 begin
-  GetInstance._Stop(Wait);
+  TInterlocked.Exchange(FGlobalStopping, 1);
+  if Assigned(FInstance) then
+    FInstance._Stop(Wait);
+end;
+
+class procedure TCommonThreadPool.StopAccepting;
+begin
+  TInterlocked.Exchange(FGlobalStopping, 1);
+  if not Assigned(FInstance) then
+    Exit;
+
+  FInstance.FAcceptingStopped := True;
+  FInstance.FQueueEvent.SetEvent;
 end;
 
 class function TCommonThreadPool.IsStopped: Boolean;
 begin
-  Result := GetInstance.Stopped;
+  Result := (not Assigned(FInstance)) or FInstance.Stopped;
 end;
 
 function TCommonThreadPool.TryEnterKind(Kind: Integer): Boolean;
@@ -1851,6 +1928,8 @@ var
   Active, Quota: Integer;
 begin
   if FStopping then
+    Exit(false);
+  if FAcceptingStopped then
     Exit(false);
   Result := True;
   FQuotaCS.Enter;
@@ -1875,17 +1954,17 @@ begin
   end;
 end;
 
-function TCommonThreadPool.TryTakeQuotaTaskAny: IThreadTask;
+function TCommonThreadPool.TryTakeQuotaTaskAny(out AReservedKind: Integer): IThreadTask;
 var
   Pair: TPair<Integer, TQueue<IThreadTask>>;
   Kind, Active, Quota: Integer;
 begin
-{$IFDEF DEBUG}
+{$IFDEF THREADPOOL_VERBOSE_LOG}
   Log(Format('[TRY-QUOTA] WorkersIdle=%d QuotaQueues=%d', [FWorkersIdle, FQuotaQueues.Count]), etDebug);
 {$ENDIF}
   Result := nil;
+  AReservedKind := -1;
 
-  // Only inspect quota state here
   FQuotaCS.Enter;
   try
     for Pair in FQuotaQueues do begin
@@ -1900,19 +1979,19 @@ begin
       if not FActiveByKind.TryGetValue(Kind, Active) then
         Active := 0;
 
-      // quota full ¡ú skip
       if Active >= Quota then
         Continue;
 
-      // Take the task atomically
       Result := Pair.Value.Dequeue;
-{$IFDEF DEBUG}
+      FActiveByKind.AddOrSetValue(Kind, Active + 1);
+      AReservedKind := Kind;
+{$IFDEF THREADPOOL_VERBOSE_LOG}
       Log(
           Format(
               '[Q-OUT] Kind=%d Key=%x Active=%d Quota=%d Remain=%d',
-              [Result.Kind, Result.Key, Active, Quota, Pair.Value.Count]
+              [Result.Kind, Result.Key, Active + 1, Quota, Pair.Value.Count]
           ),
-          etDebug
+          etInfo
       );
 {$ENDIF}
       Exit;
@@ -1922,27 +2001,43 @@ begin
   end;
 end;
 
-function TCommonThreadPool.TryTakeQuotaTaskByKind(Kind: Integer): IThreadTask;
+function TCommonThreadPool.TryTakeQuotaTaskByKind(Kind: Integer; out AReservedKind: Integer): IThreadTask;
 var
   Q: TQueue<IThreadTask>;
+  Active, Quota: Integer;
 begin
   Result := nil;
+  AReservedKind := -1;
 
-  // Only proceed if a quota queue exists for this kind
   FQuotaCS.Enter;
   try
     if not FQuotaQueues.TryGetValue(Kind, Q) then
       Exit;
 
-    // Take the first task if the queue is not empty
-    if Q.Count > 0 then
-      Result := Q.Dequeue;
+    if Q.Count = 0 then
+      Exit;
 
-    // Optional: remove empty queue
-    //    if Q.Count = 0 then begin
-    //      FQuotaQueues.Remove(Kind);
-    //      Q.Free;
-    //    end;
+    if not FQuotaByKind.TryGetValue(Kind, Quota) then
+      Exit;
+
+    if not FActiveByKind.TryGetValue(Kind, Active) then
+      Active := 0;
+
+    if Active >= Quota then
+      Exit;
+
+    Result := Q.Dequeue;
+    FActiveByKind.AddOrSetValue(Kind, Active + 1);
+    AReservedKind := Kind;
+{$IFDEF THREADPOOL_VERBOSE_LOG}
+    Log(
+        Format(
+            '[Q-OUT] Kind=%d Key=%x Active=%d Quota=%d Remain=%d',
+            [Result.Kind, Result.Key, Active + 1, Quota, Q.Count]
+        ),
+        etInfo
+    );
+{$ENDIF}
   finally
     FQuotaCS.Leave;
   end;
@@ -2042,10 +2137,12 @@ procedure TCommonThreadPool._Stop(Wait: Boolean);
 var
   W: TWorker;
 begin
+  TInterlocked.Exchange(FGlobalStopping, 1);
   if FStopping or FStopped then
     Exit;
 
   FStopping := True;
+  FAcceptingStopped := True;
 
   // 1. Wake ALL workers
   FQueueEvent.SetEvent;
