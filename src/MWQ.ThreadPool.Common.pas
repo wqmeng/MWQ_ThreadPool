@@ -378,7 +378,7 @@ end;
 
 constructor TCommonThreadPool.TWorker.Create(AOwner: TCommonThreadPool);
 begin
-  inherited Create(False);
+  inherited Create(True);
   FreeOnTerminate := False;
   FOwner := AOwner;
   FState := wsIdle;
@@ -456,19 +456,20 @@ begin
     LReservedKind := -1;
 
     { STEP 1: Runnable task }
-    if Self.FKind <> wkQuota then begin
-      if Self.FKind = wkBurst then begin
-        Task := FOwner.DequeueRunnableTaskMinPriority(5);
-        if Task = nil then begin
+    if Self.FKind = wkBurst then begin
+      Task := FOwner.DequeueRunnableTaskMinPriority(5);
+      if Task = nil then begin
 {$IFDEF DEBUG}
-          Log(Format('Worker exit burst [TID=%d]', [Tid]), etDebug);
+        Log(Format('Worker exit burst [TID=%d]', [Tid]), etDebug);
 {$ENDIF}
-          Break; // burst worker intentionally exits
-        end;
-      end
-      else
-        Task := FOwner.DequeueRunnableTask;
-    end;
+        Break; // burst worker intentionally exits
+      end;
+    end
+    else if Self.FKind = wkQuota then
+      { High-priority control tasks must not wait behind quota work. }
+      Task := FOwner.DequeueRunnableTaskMinPriority(5)
+    else
+      Task := FOwner.DequeueRunnableTask;
 
     { STEP 2: Quota task }
     if Task = nil then begin
@@ -900,6 +901,7 @@ begin
     Inc(FBaseCount);
     FWorkers[I] := TWorker.Create(Self);
     FWorkers[I].FreeOnTerminate := false;
+    FWorkers[I].Start;
   end;
 end;
 
@@ -1027,8 +1029,8 @@ begin
   except
     on E: Exception do begin
       FSuccess := False;
-      FSuccess := FFunc();
-      // Preserve Delphi's current exception object ownership and stack.
+      // Do not invoke the task again after an exception.  Retrying here
+      // bypasses the pool retry policy and can re-enter CEF or a one-shot task.
       raise;
     end;
   end;

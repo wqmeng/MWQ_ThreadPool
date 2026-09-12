@@ -1,4 +1,4 @@
-unit MWQ.ThreadPool.TaskKinds.Template;
+﻿unit MWQ.ThreadPool.TaskKinds.Template;
 
 interface
 
