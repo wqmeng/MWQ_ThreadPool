@@ -28,6 +28,7 @@ type
     MaxWorkers: Integer;
     RateCapacity: Int64;
     RateRefillPerSec: Int64;
+    DefaultPriority: Byte;
   end;
 
   TTaskStatus = (tsPending, tsRunning, tsSucceeded, tsFailed, tsCanceled);
@@ -197,7 +198,8 @@ type
         const AName: string;
         MaxWorkers: Integer;
         RateCapacity: Int64;
-        RateRefillPerSec: Int64
+        RateRefillPerSec: Int64;
+        DefaultPriority: Byte
     );
     procedure _CancelByOwner(Owner: UIntPtr);
     function _GetWorkerStats: TThreadPoolWorkerStats;
@@ -245,7 +247,8 @@ type
         AKind: Integer;
         const AName: string;
         MaxWorkers: Integer;
-        RateCapacity, RateRefillPerSec: Int64
+        RateCapacity, RateRefillPerSec: Int64;
+        DefaultPriority: Byte = 0
     ); static;
     class procedure CancelByOwner(Owner: UIntPtr); static;
     class function GetWorkerStats: TThreadPoolWorkerStats;
@@ -1375,9 +1378,23 @@ class procedure TCommonThreadPool.EnqueueProc(
     ACanRetry: Boolean = False;
     AContext: TObject = nil
 );
+var
+  LPool: TCommonThreadPool;
+  LConfig: TTaskKindConfig;
+  LEffectivePriority: Byte;
 begin
+  LEffectivePriority := APriority;
+  if (APriority = 0) then begin
+    LPool := GetInstance;
+    if (LPool <> nil) and LPool.GetKindConfig(AKind, LConfig) then
+      LEffectivePriority := LConfig.DefaultPriority;
+  end;
+
+  if LEffectivePriority > PRIORITY_MAX then
+    LEffectivePriority := PRIORITY_MAX;
+
   EnqueueTask(
-      TAnonymousThreadTask.Create(AFunc, APriority, AKind, ATaskOwner, AKey, ADeadlineTick, ACanRetry, AContext)
+      TAnonymousThreadTask.Create(AFunc, LEffectivePriority, AKind, ATaskOwner, AKey, ADeadlineTick, ACanRetry, AContext)
   );
 end;
 
@@ -1711,14 +1728,15 @@ class procedure TCommonThreadPool.RegisterTaskKind(
     AKind: Integer;
     const AName: string;
     MaxWorkers: Integer;
-    RateCapacity, RateRefillPerSec: Int64
+    RateCapacity, RateRefillPerSec: Int64;
+    DefaultPriority: Byte
 );
 var
   LPool: TCommonThreadPool;
 begin
   LPool := GetInstance;
   if LPool <> nil then
-    LPool._RegisterTaskKind(AKind, AName, MaxWorkers, RateCapacity, RateRefillPerSec);
+    LPool._RegisterTaskKind(AKind, AName, MaxWorkers, RateCapacity, RateRefillPerSec, DefaultPriority);
 end;
 
 procedure TCommonThreadPool.RetireIdleWorker;
@@ -2117,7 +2135,8 @@ procedure TCommonThreadPool._RegisterTaskKind(
     AKind: Integer;
     const AName: string;
     MaxWorkers: Integer;
-    RateCapacity, RateRefillPerSec: Int64
+    RateCapacity, RateRefillPerSec: Int64;
+    DefaultPriority: Byte
 );
 var
   Cfg: TTaskKindConfig;
@@ -2126,6 +2145,7 @@ begin
   Cfg.MaxWorkers := MaxWorkers;
   Cfg.RateCapacity := RateCapacity;
   Cfg.RateRefillPerSec := RateRefillPerSec;
+  Cfg.DefaultPriority := EnsureRange(DefaultPriority, 0, PRIORITY_MAX);
 
   // store config
   FTaskKinds.AddOrSetValue(AKind, Cfg);
