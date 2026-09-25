@@ -29,7 +29,9 @@ package MWQ_ThreadPool;
 
 requires
   rtl,
-  QuickLogger_D12;
+  QuickLogger_D12,
+  LogBridge,
+  Spring.Base;
 
 contains
   MWQ.ThreadPool.Common in '..\..\src\MWQ.ThreadPool.Common.pas',

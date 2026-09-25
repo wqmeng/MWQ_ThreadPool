@@ -108,6 +108,8 @@
         </DelphiCompile>
         <DCCReference Include="rtl.dcp"/>
         <DCCReference Include="QuickLogger_D12.dcp"/>
+        <DCCReference Include="LogBridge.dcp"/>
+        <DCCReference Include="Spring.Base.dcp"/>
         <DCCReference Include="..\..\src\MWQ.ThreadPool.Common.pas"/>
         <DCCReference Include="..\..\src\MWQ.ThreadPool.TaskKinds.Template.pas"/>
         <DCCReference Include="..\..\src\MWQ.ThreadPool.CPUUsage.pas"/>

@@ -7,7 +7,10 @@ uses
   System.SysUtils,
   System.SyncObjs,
   System.Generics.Collections,
-  MWQ.ThreadPool.CPUUsage;
+  MWQ.ThreadPool.CPUUsage,
+  MWQ.LogBridge,
+  MWQ.LogBridge.ICommonLogger,
+  MWQ.LogBridge.LockDiagnostics;
 
 const
   PRIORITY_MAX = 7;
@@ -367,7 +370,6 @@ function BackoffMs(Retry: Integer): Integer;
 implementation
 
 uses
-  Quick.Logger,
   System.Math;
 
 // ---------------------------- UTILITIES ----------------------------
@@ -393,7 +395,7 @@ begin
   if FState = AState then
     Exit;
 
-  FOwner.FWorkerCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FOwner.FWorkerCS, 'TCommonThreadPool.Worker');
   try
     if FState = wsIdle then
       Dec(FOwner.FWorkersIdle)
@@ -414,7 +416,7 @@ begin
       end;
     end;
   finally
-    FOwner.FWorkerCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FOwner.FWorkerCS, 'TCommonThreadPool.Worker');
   end;
 end;
 
@@ -746,7 +748,7 @@ begin
     Exit(False);
 
   Result := True;
-  FRateCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FRateCS, 'TCommonThreadPool.Rate');
   try
     if not FRateLimiters.TryGetValue(Kind, L) then
       Exit;
@@ -768,7 +770,7 @@ begin
 
     FRateLimiters[Kind] := L;
   finally
-    FRateCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FRateCS, 'TCommonThreadPool.Rate');
   end;
 end;
 
@@ -790,7 +792,7 @@ begin
     Exit;
 
   for P := 0 to PRIORITY_MAX do begin
-    FQueueLocks[P].Enter;
+    TLockDiagnostics.CriticalSectionEnter(FQueueLocks[P], 'TCommonThreadPool.Queue');
     try
       TempQueue := TQueue<IThreadTask>.Create;
       try
@@ -810,7 +812,7 @@ begin
         TempQueue.Free;
       end;
     finally
-      FQueueLocks[P].Leave;
+      TLockDiagnostics.CriticalSectionExit(FQueueLocks[P], 'TCommonThreadPool.Queue');
     end;
   end;
 end;
@@ -915,7 +917,7 @@ begin
   Result := nil;
 
   for P := PRIORITY_MAX downto 0 do begin
-    FQueueLocks[P].Enter;
+    TLockDiagnostics.CriticalSectionEnter(FQueueLocks[P], 'TCommonThreadPool.Queue');
     try
       if FQueues[P].Count > 0 then begin
         Result := FQueues[P].Dequeue;
@@ -923,7 +925,7 @@ begin
         Exit;
       end;
     finally
-      FQueueLocks[P].Leave;
+      TLockDiagnostics.CriticalSectionExit(FQueueLocks[P], 'TCommonThreadPool.Queue');
     end;
   end;
 end;
@@ -935,7 +937,7 @@ begin
   Result := nil;
 
   for P := PRIORITY_MAX downto MinPriority do begin
-    FQueueLocks[P].Enter;
+    TLockDiagnostics.CriticalSectionEnter(FQueueLocks[P], 'TCommonThreadPool.Queue');
     try
       if FQueues[P].Count > 0 then begin
         Result := FQueues[P].Dequeue;
@@ -944,7 +946,7 @@ begin
         Exit;
       end;
     finally
-      FQueueLocks[P].Leave;
+      TLockDiagnostics.CriticalSectionExit(FQueueLocks[P], 'TCommonThreadPool.Queue');
     end;
   end;
 end;
@@ -957,7 +959,7 @@ var
 begin
   Result := nil;
   for P := PRIORITY_MAX downto 0 do begin
-    FQueueLocks[P].Enter;
+    TLockDiagnostics.CriticalSectionEnter(FQueueLocks[P], 'TCommonThreadPool.Queue');
     try
       if FQueues[P].Count > 0 then begin
         Result := FQueues[P].Dequeue;
@@ -966,7 +968,7 @@ begin
         Exit;
       end;
     finally
-      FQueueLocks[P].Leave;
+      TLockDiagnostics.CriticalSectionExit(FQueueLocks[P], 'TCommonThreadPool.Queue');
     end;
   end;
 end;
@@ -1088,7 +1090,7 @@ begin
   _Stop(True); // ALWAYS wait in destructor
   FQueueEvent.SetEvent;
 
-  FWorkerCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FWorkerCS, 'TCommonThreadPool.Worker');
   try
     for W in FWorkers do begin
       W.Terminate;
@@ -1097,7 +1099,7 @@ begin
     end;
     //    FWorkers.F; // MISSING
   finally
-    FWorkerCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FWorkerCS, 'TCommonThreadPool.Worker');
   end;
   if length(FBurstWorkers) > 0 then begin
     for W in FBurstWorkers do begin
@@ -1114,23 +1116,23 @@ begin
   end;
 
   // 3. Free quota queues (MISSING ENTIRELY)
-  FQuotaCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FQuotaCS, 'TCommonThreadPool.Quota');
   try
     for Q in FQuotaQueues.Values do
       Q.Free;
     FQuotaQueues.Free;
   finally
-    FQuotaCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FQuotaCS, 'TCommonThreadPool.Quota');
   end;
 
   // 4. Free metrics
-  FMetricsCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FMetricsCS, 'TCommonThreadPool.Metrics');
   try
     for P in FMetrics.Values do
       Dispose(P);
     FMetrics.Free;
   finally
-    FMetricsCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FMetricsCS, 'TCommonThreadPool.Metrics');
   end;
   FMetricsCS.Free;
 
@@ -1238,6 +1240,7 @@ end;
 procedure TCommonThreadPool.Enqueue(const Task: IThreadTask; const IsRequeue: Boolean = False);
 var
   P, Kind: Integer;
+  TaskKey: UIntPtr;
   PriorityValue: Byte;
   Metrics: PThreadPoolMetrics;
 begin
@@ -1252,13 +1255,15 @@ begin
   end;
 
   Kind := GetKind(Task);
+  TaskKey := Task.Key;
+  PriorityValue := Task.Priority;
 
   if not IsKindRegistered(Kind) then begin
 {$IFDEF DEBUG}
     Log(
         Format(
             'ThreadPool.Enqueue rejected: Kind not registered (Kind=%d Key=%x Priority=%d)',
-            [Kind, Task.Key, Task.Priority]
+            [Kind, TaskKey, PriorityValue]
         ),
         etError
     );
@@ -1267,7 +1272,7 @@ begin
   end;
 
   { Ensure metrics entry exists }
-  FMetricsCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FMetricsCS, 'TCommonThreadPool.Metrics');
   try
     if not FMetrics.TryGetValue(Kind, Metrics) then begin
       New(Metrics);
@@ -1279,7 +1284,7 @@ begin
 {$ENDIF}
     end;
   finally
-    FMetricsCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FMetricsCS, 'TCommonThreadPool.Metrics');
   end;
 
   { Rate limiting }
@@ -1290,7 +1295,7 @@ begin
     Log(
         Format(
             'Rate limit hit (Kind=%d Key=%x Priority=%d Drop=%s)',
-            [Kind, Task.Key, Task.Priority, BoolToStr(FDropTaskOnThrottle, True)]
+            [Kind, TaskKey, PriorityValue, BoolToStr(FDropTaskOnThrottle, True)]
         ),
         etDebug
     );
@@ -1299,7 +1304,7 @@ begin
     if FDropTaskOnThrottle then begin
       IncMetric(Kind, FMetrics[Kind].Dropped);
 {$IFDEF DEBUG}
-      Log(Format('TASK DROPPED due to throttle (Kind=%d Key=%x)', [Kind, Task.Key]), etWarning);
+      Log(Format('TASK DROPPED due to throttle (Kind=%d Key=%x)', [Kind, TaskKey]), etWarning);
 {$ENDIF}
       Exit;
     end;
@@ -1311,14 +1316,15 @@ begin
   end;
 
   { Normalize priority }
-  PriorityValue := Task.Priority;
   if PriorityValue > PRIORITY_MAX then
     P := PRIORITY_MAX
   else
     P := PriorityValue;
 
   { Enqueue task }
-  FQueueLocks[P].Enter;
+  Log('TP Task before enqueue=%p Kind=%d Key=%x Priority=%d',
+    [Pointer(Task), Kind, TaskKey, PriorityValue], etWarning);
+  TLockDiagnostics.CriticalSectionEnter(FQueueLocks[P], 'TCommonThreadPool.Queue');
   try
     FQueues[P].Enqueue(Task);
     //    IncMetric(Kind, FMetrics[Kind].QueueDepth);
@@ -1332,14 +1338,16 @@ begin
       // QueueDepth unchanged (already decremented)
     end;
   finally
-    FQueueLocks[P].Leave;
+    TLockDiagnostics.CriticalSectionExit(FQueueLocks[P], 'TCommonThreadPool.Queue');
   end;
+  Log('TP Task after enqueue=%p Kind=%d Key=%x Priority=%d',
+    [Pointer(Task), Kind, TaskKey, PriorityValue], etWarning);
 
 {$IFDEF DEBUG}
   Log(
       Format(
           'ThreadPool.Enqueue OK (Kind=%d Key=%x Priority=%d QueuePrio=%d QueueDepth=%d)',
-          [Kind, Task.Key, Task.Priority, P, FMetrics[Kind].QueueDepth]
+          [Kind, TaskKey, PriorityValue, P, FMetrics[Kind].QueueDepth]
       ),
       etDebug
   );
@@ -1347,21 +1355,26 @@ begin
 
   { Burst worker }
   if not IsRequeue then begin
-    if (Task.Priority >= 5) and (FWorkersIdle = 0) and (FWorkersTotal < FMaxWorkers + FBurstLimit) then begin
+    try
+      if (PriorityValue >= 5) and (FWorkersIdle = 0) and (FWorkersTotal < FMaxWorkers + FBurstLimit) then begin
 {$IFDEF DEBUG}
-      Log(
-          Format(
-              'ThreadPool.SpawnBurstWorker (Reason=HighPriority Kind=%d Key=%x Workers=%d Idle=%d)',
-              [Kind, Task.Key, FWorkersTotal, FWorkersIdle]
-          ),
-          etDebug
-      );
+        Log(
+            Format(
+                'ThreadPool.SpawnBurstWorker (Reason=HighPriority Kind=%d Key=%x Workers=%d Idle=%d)',
+                [Kind, TaskKey, FWorkersTotal, FWorkersIdle]
+            ),
+            etDebug
+        );
 {$ENDIF}
 
-      SpawnBurstWorker;
-    end
-    else begin
-      CheckScale;
+        SpawnBurstWorker;
+      end
+      else begin
+        CheckScale;
+      end;
+    except
+      on E: Exception do
+        Log('TCommonThreadPool.Enqueue %s' + sLineBreak + '%s', [E.Message, E.StackTrace], etException);
     end;
   end;
 
@@ -1394,7 +1407,8 @@ begin
     LEffectivePriority := PRIORITY_MAX;
 
   EnqueueTask(
-      TAnonymousThreadTask.Create(AFunc, LEffectivePriority, AKind, ATaskOwner, AKey, ADeadlineTick, ACanRetry, AContext)
+      TAnonymousThreadTask
+          .Create(AFunc, LEffectivePriority, AKind, ATaskOwner, AKey, ADeadlineTick, ACanRetry, AContext)
   );
 end;
 
@@ -1409,22 +1423,22 @@ begin
   Kind := GetKind(Task);
 
   // Ensure the quota queue exists
-  FQuotaCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FQuotaCS, 'TCommonThreadPool.Quota');
   try
     if not FQuotaQueues.TryGetValue(Kind, Q) then begin
       Q := TQueue<IThreadTask>.Create;
       FQuotaQueues.Add(Kind, Q);
     end;
   finally
-    FQuotaCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FQuotaCS, 'TCommonThreadPool.Quota');
   end;
 
   // Enqueue the task into the quota queue
-  FQuotaCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FQuotaCS, 'TCommonThreadPool.Quota');
   try
     Q.Enqueue(Task);
   finally
-    FQuotaCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FQuotaCS, 'TCommonThreadPool.Quota');
   end;
 {$IFDEF THREADPOOL_VERBOSE_LOG}
   Log(Format('[Q-IN] Kind=%d Key=%x QCount=%d', [Task.Kind, Task.Key, Q.Count]), etInfo);
@@ -1446,12 +1460,12 @@ begin
     P := 0;
 
   // Enqueue into runnable queue
-  FQueueLocks[P].Enter;
+  TLockDiagnostics.CriticalSectionEnter(FQueueLocks[P], 'TCommonThreadPool.Queue');
   try
     FQueues[P].Enqueue(Task);
     Inc(FQueueDepth); // global runnable depth
   finally
-    FQueueLocks[P].Leave;
+    TLockDiagnostics.CriticalSectionExit(FQueueLocks[P], 'TCommonThreadPool.Queue');
   end;
 
   // Wake one sleeping worker
@@ -1474,16 +1488,16 @@ begin
   if FStopping then
     Exit;
 
-  FKeyLockCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FKeyLockCS, 'TCommonThreadPool.Key');
   try
     if not FKeyLocks.TryGetValue(Key, L) then begin
       L := Default(TLightweightMREW);
       FKeyLocks.Add(Key, L);
     end;
   finally
-    FKeyLockCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FKeyLockCS, 'TCommonThreadPool.Key');
   end;
-  L.BeginWrite;
+  TLockDiagnostics.LightweightBeginWrite(L, 'TCommonThreadPool.Key', Pointer(Key));
 end;
 
 class function TCommonThreadPool.GetInstance: TCommonThreadPool;
@@ -1516,14 +1530,14 @@ var
 begin
   Result := TDictionary<Integer, TThreadPoolMetrics>.Create;
 
-  FMetricsCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FMetricsCS, 'TCommonThreadPool.Metrics');
   try
     for K in FMetrics.Keys do begin
       P := FMetrics[K];
       Result.Add(K, P^); // copy
     end;
   finally
-    FMetricsCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FMetricsCS, 'TCommonThreadPool.Metrics');
   end;
 end;
 
@@ -1534,14 +1548,14 @@ begin
   Result := False;
   FillChar(Metrics, SizeOf(Metrics), 0);
 
-  FMetricsCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FMetricsCS, 'TCommonThreadPool.Metrics');
   try
     if FMetrics.TryGetValue(Kind, P) then begin
       Metrics := P^;
       Result := True;
     end;
   finally
-    FMetricsCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FMetricsCS, 'TCommonThreadPool.Metrics');
   end;
 end;
 
@@ -1553,13 +1567,13 @@ var
 begin
   FillChar(Result, SizeOf(Result), 0);
 
-  FMetricsCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FMetricsCS, 'TCommonThreadPool.Metrics');
   try
     // Aggregate per-kind execution metrics
     for P in FMetrics.Values do
       AddMetrics(Result, P^);
   finally
-    FMetricsCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FMetricsCS, 'TCommonThreadPool.Metrics');
   end;
 
   // -----------------------------
@@ -1578,14 +1592,14 @@ begin
   // -----------------------------
   Result.QuotaQueue := 0;
 
-  FQuotaCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FQuotaCS, 'TCommonThreadPool.Quota');
   try
     for Pair in FQuotaQueues do begin
       Inc(Result.QuotaQueue, Pair.Value.Count);
       Inc(Result.QueueDepth, Pair.Value.Count);
     end;
   finally
-    FQuotaCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FQuotaCS, 'TCommonThreadPool.Quota');
   end;
 end;
 
@@ -1619,23 +1633,23 @@ end;
 
 function TCommonThreadPool.HasKindQuota(Kind: Integer): Boolean;
 begin
-  FQuotaCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FQuotaCS, 'TCommonThreadPool.Quota');
   try
     Result := FQuotaByKind.ContainsKey(Kind);
   finally
-    FQuotaCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FQuotaCS, 'TCommonThreadPool.Quota');
   end;
 end;
 
 procedure TCommonThreadPool.IncMetric(Kind: Integer; var Field: Int64; Delta: Int64);
 begin
-  FMetricsCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FMetricsCS, 'TCommonThreadPool.Metrics');
   try
     if not FMetrics.ContainsKey(Kind) then
       FMetrics.Add(Kind, New(PThreadPoolMetrics));
     Inc(Field, Delta);
   finally
-    FMetricsCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FMetricsCS, 'TCommonThreadPool.Metrics');
   end;
 end;
 
@@ -1648,12 +1662,12 @@ procedure TCommonThreadPool.LeaveKey(Key: UIntPtr);
 var
   L: TLightweightMREW;
 begin
-  FKeyLockCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FKeyLockCS, 'TCommonThreadPool.Key');
   try
     if FKeyLocks.TryGetValue(Key, L) then
-      L.EndWrite;
+      TLockDiagnostics.LightweightEndWrite(L, 'TCommonThreadPool.Key', Pointer(Key));
   finally
-    FKeyLockCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FKeyLockCS, 'TCommonThreadPool.Key');
   end;
 end;
 
@@ -1665,7 +1679,7 @@ var
 begin
   LShouldWake := False;
 
-  FQuotaCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FQuotaCS, 'TCommonThreadPool.Quota');
   try
     if not FActiveByKind.TryGetValue(Kind, V) then
       Exit;
@@ -1680,7 +1694,7 @@ begin
     Log(Format('[LEAVE] Kind=%d Active=%d->%d', [Kind, V + 1, V]), etDebug);
 {$ENDIF}
   finally
-    FQuotaCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FQuotaCS, 'TCommonThreadPool.Quota');
   end;
 
   if LShouldWake and (not FStopping) then
@@ -1689,11 +1703,11 @@ end;
 
 function TCommonThreadPool.MetricsSnapshot: TDictionary<Integer, PThreadPoolMetrics>;
 begin
-  FMetricsCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FMetricsCS, 'TCommonThreadPool.Metrics');
   try
     Result := TDictionary<Integer, PThreadPoolMetrics>.Create(FMetrics);
   finally
-    FMetricsCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FMetricsCS, 'TCommonThreadPool.Metrics');
   end;
 end;
 
@@ -1701,7 +1715,7 @@ procedure TCommonThreadPool.OnBurstWorkerExit(Worker: TWorker);
 var
   I, N: Integer;
 begin
-  FWorkerCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FWorkerCS, 'TCommonThreadPool.Worker');
   try
     // Remove from FBurstWorkers array
     for I := 0 to High(FBurstWorkers) do begin
@@ -1717,7 +1731,7 @@ begin
     Dec(FWorkersTotal);
     Dec(FWorkersBurst);
   finally
-    FWorkerCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FWorkerCS, 'TCommonThreadPool.Worker');
   end;
 
   // Now safe to free (outside lock)
@@ -1748,7 +1762,7 @@ var
 begin
   NowTick := TThread.GetTickCount64;
 
-  FWorkerCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FWorkerCS, 'TCommonThreadPool.Worker');
   try
     if FWorkersTotal <= FMinWorkers then
       Exit;
@@ -1780,7 +1794,7 @@ begin
       end;
     end;
   finally
-    FWorkerCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FWorkerCS, 'TCommonThreadPool.Worker');
   end;
 end;
 
@@ -1790,7 +1804,7 @@ var
   CS: TCriticalSection;
   Task: IThreadTask;
 begin
-  FQuotaCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FQuotaCS, 'TCommonThreadPool.Quota');
   try
     if MaxWorkers <= 0 then begin
       // Disable quota
@@ -1799,14 +1813,14 @@ begin
 
       // Drain quota queue back to runnable queue
       if FQuotaQueues.TryGetValue(Kind, Q) and FQuotaQueueCS.TryGetValue(Kind, CS) then begin
-        CS.Enter;
+        TLockDiagnostics.CriticalSectionEnter(CS, 'TCommonThreadPool.QuotaQueue');
         try
           while Q.Count > 0 do begin
             Task := Q.Dequeue;
             EnqueueRunnableTask(Task); // <-- must wake workers
           end;
         finally
-          CS.Leave;
+          TLockDiagnostics.CriticalSectionExit(CS, 'TCommonThreadPool.QuotaQueue');
         end;
 
         FQuotaQueues.Remove(Kind);
@@ -1834,7 +1848,7 @@ begin
       FQuotaQueueCS.Add(Kind, TCriticalSection.Create);
 
   finally
-    FQuotaCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FQuotaCS, 'TCommonThreadPool.Quota');
   end;
 end;
 
@@ -1842,7 +1856,7 @@ procedure TCommonThreadPool.SetRateLimit(Kind: Integer; Capacity, RefillPerSec: 
 var
   L: TKindRateLimiter;
 begin
-  FRateCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FRateCS, 'TCommonThreadPool.Rate');
   try
     // Disable rate limiting
     if (Capacity <= 0) or (RefillPerSec <= 0) then begin
@@ -1858,7 +1872,7 @@ begin
 
     FRateLimiters.AddOrSetValue(Kind, L);
   finally
-    FRateCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FRateCS, 'TCommonThreadPool.Rate');
   end;
 end;
 
@@ -1878,7 +1892,7 @@ begin
   if not CpuAllowsScaleUp(CPU_BURST_LIMIT) then
     Exit;
 
-  FWorkerCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FWorkerCS, 'TCommonThreadPool.Worker');
   try
     if FWorkersTotal >= FMaxWorkers + FBurstLimit then
       Exit;
@@ -1893,7 +1907,7 @@ begin
     FBurstWorkers[High(FBurstWorkers)] := W;
     W.Start;
   finally
-    FWorkerCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FWorkerCS, 'TCommonThreadPool.Worker');
   end;
 end;
 
@@ -1901,7 +1915,7 @@ procedure TCommonThreadPool.SpawnWorker;
 var
   Worker: TWorker;
 begin
-  FWorkerCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FWorkerCS, 'TCommonThreadPool.Worker');
   try
     if FWorkersTotal >= FMaxWorkers then
       Exit;
@@ -1917,7 +1931,7 @@ begin
 
     Worker.Start;
   finally
-    FWorkerCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FWorkerCS, 'TCommonThreadPool.Worker');
   end;
 end;
 
@@ -1952,7 +1966,7 @@ begin
   if FAcceptingStopped then
     Exit(false);
   Result := True;
-  FQuotaCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FQuotaCS, 'TCommonThreadPool.Quota');
   try
     if not FQuotaByKind.TryGetValue(Kind, Quota) then
       Exit;
@@ -1970,7 +1984,7 @@ begin
     Log(Format('[ENTER true] Kind=%d Active=%d->%d', [Kind, Active, Active + 1]), etDebug);
 {$ENDIF}
   finally
-    FQuotaCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FQuotaCS, 'TCommonThreadPool.Quota');
   end;
 end;
 
@@ -1985,7 +1999,7 @@ begin
   Result := nil;
   AReservedKind := -1;
 
-  FQuotaCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FQuotaCS, 'TCommonThreadPool.Quota');
   try
     for Pair in FQuotaQueues do begin
       if Pair.Value.Count = 0 then
@@ -2017,7 +2031,7 @@ begin
       Exit;
     end;
   finally
-    FQuotaCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FQuotaCS, 'TCommonThreadPool.Quota');
   end;
 end;
 
@@ -2029,7 +2043,7 @@ begin
   Result := nil;
   AReservedKind := -1;
 
-  FQuotaCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FQuotaCS, 'TCommonThreadPool.Quota');
   try
     if not FQuotaQueues.TryGetValue(Kind, Q) then
       Exit;
@@ -2059,7 +2073,7 @@ begin
     );
 {$ENDIF}
   finally
-    FQuotaCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FQuotaCS, 'TCommonThreadPool.Quota');
   end;
 end;
 
@@ -2088,7 +2102,7 @@ begin
     Exit;
 
   for P := 0 to PRIORITY_MAX do begin
-    FQueueLocks[P].Enter;
+    TLockDiagnostics.CriticalSectionEnter(FQueueLocks[P], 'TCommonThreadPool.Queue');
     try
       Tmp := TQueue<IThreadTask>.Create;
       try
@@ -2108,14 +2122,27 @@ begin
         Tmp.Free;
       end;
     finally
-      FQueueLocks[P].Leave;
+      TLockDiagnostics.CriticalSectionExit(FQueueLocks[P], 'TCommonThreadPool.Queue');
     end;
   end;
 end;
 
 function TCommonThreadPool._GetWorkerStats: TThreadPoolWorkerStats;
+var
+  LStartTick: UInt64;
 begin
-  FWorkerCS.Enter;
+  LStartTick := TThread.GetTickCount64;
+  Log(
+      Format('[NEWS_STATS] WORKER_LOCK WAIT Lock=%p Pool=%p Thread=%d Tick=%d',
+        [Pointer(@FWorkerCS), Pointer(Self), TThread.CurrentThread.ThreadID, LStartTick]),
+      etDebug
+  );
+  TLockDiagnostics.CriticalSectionEnter(FWorkerCS, 'TCommonThreadPool.Worker');
+  Log(
+      Format('[NEWS_STATS] WORKER_LOCK ACQUIRED Lock=%p Pool=%p Thread=%d WaitMs=%d',
+        [Pointer(@FWorkerCS), Pointer(Self), TThread.CurrentThread.ThreadID, TThread.GetTickCount64 - LStartTick]),
+      etDebug
+  );
   try
     Result.MinWorkers := FMinWorkers;
     Result.MaxWorkers := FMaxWorkers;
@@ -2127,7 +2154,17 @@ begin
     Result.DynamicWorkers := FDynamicCount;
     Result.BurstWorkers := FBurstCount;
   finally
-    FWorkerCS.Leave;
+    Log(
+        Format('[NEWS_STATS] WORKER_LOCK RELEASING Lock=%p Pool=%p Thread=%d HeldMs=%d',
+          [Pointer(@FWorkerCS), Pointer(Self), TThread.CurrentThread.ThreadID, TThread.GetTickCount64 - LStartTick]),
+        etDebug
+    );
+    TLockDiagnostics.CriticalSectionExit(FWorkerCS, 'TCommonThreadPool.Worker');
+    Log(
+        Format('[NEWS_STATS] WORKER_LOCK RELEASED Lock=%p Pool=%p Thread=%d',
+          [Pointer(@FWorkerCS), Pointer(Self), TThread.CurrentThread.ThreadID]),
+        etDebug
+    );
   end;
 end;
 
@@ -2170,7 +2207,7 @@ begin
   FQueueEvent.SetEvent;
 
   // 2. Ask workers to terminate
-  FWorkerCS.Enter;
+  TLockDiagnostics.CriticalSectionEnter(FWorkerCS, 'TCommonThreadPool.Worker');
   try
     for W in FWorkers do
       W.Terminate;
@@ -2179,7 +2216,7 @@ begin
         W.Terminate;
     end;
   finally
-    FWorkerCS.Leave;
+    TLockDiagnostics.CriticalSectionExit(FWorkerCS, 'TCommonThreadPool.Worker');
   end;
 
   // 3. Optionally wait
