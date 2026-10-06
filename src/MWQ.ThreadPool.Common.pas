@@ -115,6 +115,11 @@ type
 
   private
     type
+      TKeyLock = class
+      public
+        Lock: TLightweightMREW;
+      end;
+
       TWorker = class(TThread)
       private
         FOwner: TCommonThreadPool;
@@ -146,7 +151,7 @@ type
     FQueueDepth: Integer;
     FQueueQuota: Integer;
 
-    FKeyLocks: TDictionary<UIntPtr, TLightweightMREW>;
+    FKeyLocks: TObjectDictionary<UIntPtr, TKeyLock>;
     FKeyLockCS: TCriticalSection;
 
     FMetrics: TDictionary<Integer, PThreadPoolMetrics>;
@@ -188,8 +193,8 @@ type
     function DequeueTask: IThreadTask;
     function GetKind(const Task: IThreadTask): Integer;
 
-    procedure EnterKey(Key: UIntPtr);
-    procedure LeaveKey(Key: UIntPtr);
+    function EnterKey(Key: UIntPtr): TKeyLock;
+    procedure LeaveKey(const ALock: TKeyLock; Key: UIntPtr);
 
     function AllowByRate(Kind: Integer): Boolean;
     function TryEnterKind(Kind: Integer): Boolean;
@@ -451,6 +456,8 @@ var
   Kind: Integer;
   LQuotaEntered: Boolean;
   LReservedKind: Integer;
+  LKey: UIntPtr;
+  LKeyLock: TKeyLock;
 begin
   Tid := TThread.CurrentThread.ThreadID;;
   SetState(wsBusy);
@@ -649,7 +656,8 @@ begin
     );
 {$ENDIF}
 
-    FOwner.EnterKey(Task.Key);
+    LKey := Task.Key;
+    LKeyLock := FOwner.EnterKey(LKey);
     try
       LRetry := 0;
       StartTick := GetTickCount64;
@@ -694,8 +702,12 @@ begin
       FOwner.DoTaskFinished(Task, LResult, LRetry, Latency);
 
     finally
-      Task.Cleanup;
-      FOwner.LeaveKey(Task.Key);
+      try
+        Task.Cleanup;
+      finally
+        // Release the exact acquired instance, even if cleanup changes task state or raises.
+        FOwner.LeaveKey(LKeyLock, LKey);
+      end;
 
       if LQuotaEntered then begin
         FOwner.LeaveKind(Kind);
@@ -876,7 +888,8 @@ begin
     FQueueLocks[P] := TCriticalSection.Create;
   end;
 
-  FKeyLocks := TDictionary<UIntPtr, TLightweightMREW>.Create;
+  // Values stay at stable addresses until all workers have joined during destruction.
+  FKeyLocks := TObjectDictionary<UIntPtr, TKeyLock>.Create([doOwnsValues]);
   FKeyLockCS := TCriticalSection.Create;
   FWorkerCS := TCriticalSection.Create;
 
@@ -1480,23 +1493,24 @@ begin
     LPool.Enqueue(Task);
 end;
 
-procedure TCommonThreadPool.EnterKey(Key: UIntPtr);
-var
-  L: TLightweightMREW;
+function TCommonThreadPool.EnterKey(Key: UIntPtr): TKeyLock;
 begin
-  if FStopping then
-    Exit;
-
+  // Already-admitted work still uses its Key lock while the pool is stopping.
   TLockDiagnostics.CriticalSectionEnter(FKeyLockCS, 'TCommonThreadPool.Key');
   try
-    if not FKeyLocks.TryGetValue(Key, L) then begin
-      L := Default(TLightweightMREW);
-      FKeyLocks.Add(Key, L);
+    if not FKeyLocks.TryGetValue(Key, Result) then begin
+      Result := TKeyLock.Create;
+      try
+        FKeyLocks.Add(Key, Result);
+      except
+        Result.Free;
+        raise;
+      end;
     end;
   finally
     TLockDiagnostics.CriticalSectionExit(FKeyLockCS, 'TCommonThreadPool.Key');
   end;
-  TLockDiagnostics.LightweightBeginWrite(L, 'TCommonThreadPool.Key', Pointer(Key));
+  TLockDiagnostics.LightweightBeginWrite(Result.Lock, 'TCommonThreadPool.Key', Pointer(Key));
 end;
 
 class function TCommonThreadPool.GetInstance: TCommonThreadPool;
@@ -1657,17 +1671,9 @@ begin
   Result := FTaskKinds.ContainsKey(AKind);
 end;
 
-procedure TCommonThreadPool.LeaveKey(Key: UIntPtr);
-var
-  L: TLightweightMREW;
+procedure TCommonThreadPool.LeaveKey(const ALock: TKeyLock; Key: UIntPtr);
 begin
-  TLockDiagnostics.CriticalSectionEnter(FKeyLockCS, 'TCommonThreadPool.Key');
-  try
-    if FKeyLocks.TryGetValue(Key, L) then
-      TLockDiagnostics.LightweightEndWrite(L, 'TCommonThreadPool.Key', Pointer(Key));
-  finally
-    TLockDiagnostics.CriticalSectionExit(FKeyLockCS, 'TCommonThreadPool.Key');
-  end;
+  TLockDiagnostics.LightweightEndWrite(ALock.Lock, 'TCommonThreadPool.Key', Pointer(Key));
 end;
 
 procedure TCommonThreadPool.LeaveKind(Kind: Integer);
