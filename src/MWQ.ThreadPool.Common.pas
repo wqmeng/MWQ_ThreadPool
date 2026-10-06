@@ -1495,6 +1495,9 @@ end;
 
 function TCommonThreadPool.EnterKey(Key: UIntPtr): TKeyLock;
 begin
+  if Key = 0 then
+    Exit(nil);
+
   // Already-admitted work still uses its Key lock while the pool is stopping.
   TLockDiagnostics.CriticalSectionEnter(FKeyLockCS, 'TCommonThreadPool.Key');
   try
@@ -1673,6 +1676,9 @@ end;
 
 procedure TCommonThreadPool.LeaveKey(const ALock: TKeyLock; Key: UIntPtr);
 begin
+  if (ALock = nil) or (Key = 0) then
+    Exit;
+
   TLockDiagnostics.LightweightEndWrite(ALock.Lock, 'TCommonThreadPool.Key', Pointer(Key));
 end;
 
