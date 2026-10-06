@@ -397,15 +397,23 @@ begin
 
   TLockDiagnostics.CriticalSectionEnter(FOwner.FWorkerCS, 'TCommonThreadPool.Worker');
   try
-    if FState = wsIdle then
-      Dec(FOwner.FWorkersIdle)
-    else
-      Dec(FOwner.FWorkersBusy);
+    case FState of
+      wsIdle: begin
+        Dec(FOwner.FWorkersIdle);
+        if FOwner.FWorkersIdle < 0 then
+          FOwner.FWorkersIdle := 0;
+      end;
+      wsBusy: begin
+        Dec(FOwner.FWorkersBusy);
+        if FOwner.FWorkersBusy < 0 then
+          FOwner.FWorkersBusy := 0;
+      end;
+    end;
 
-    if AState = wsIdle then
-      Inc(FOwner.FWorkersIdle)
-    else
-      Inc(FOwner.FWorkersBusy);
+    case AState of
+      wsIdle: Inc(FOwner.FWorkersIdle);
+      wsBusy: Inc(FOwner.FWorkersBusy);
+    end;
 
     FState := AState;
     if FState = wsIdle then begin
@@ -551,7 +559,7 @@ begin
 {$ENDIF}
 
       // Idle timeout exit logic (burst / dynamic workers)
-      if FOwner.FStopping then
+      if FOwner.FStopping or Terminated then
         Break;
       SetState(wsBusy);
       Continue;
@@ -1090,23 +1098,14 @@ begin
   _Stop(True); // ALWAYS wait in destructor
   FQueueEvent.SetEvent;
 
-  TLockDiagnostics.CriticalSectionEnter(FWorkerCS, 'TCommonThreadPool.Worker');
-  try
-    for W in FWorkers do begin
-      W.Terminate;
-      W.WaitFor;
+  for W in FWorkers do
+    W.Free;
+  SetLength(FWorkers, 0);
+
+  if Length(FBurstWorkers) > 0 then begin
+    for W in FBurstWorkers do
       W.Free;
-    end;
-    //    FWorkers.F; // MISSING
-  finally
-    TLockDiagnostics.CriticalSectionExit(FWorkerCS, 'TCommonThreadPool.Worker');
-  end;
-  if length(FBurstWorkers) > 0 then begin
-    for W in FBurstWorkers do begin
-      W.Terminate;
-      W.WaitFor;
-      W.Free;
-    end;
+    SetLength(FBurstWorkers, 0);
   end;
 
   // 2. Free runnable queues and locks
@@ -1757,10 +1756,12 @@ procedure TCommonThreadPool.RetireIdleWorker;
 var
   I, J: Integer;
   Worker: TWorker;
+  WorkerToRetire: TWorker;
   NowTick: UInt64;
   Len: Integer;
 begin
   NowTick := TThread.GetTickCount64;
+  WorkerToRetire := nil;
 
   TLockDiagnostics.CriticalSectionEnter(FWorkerCS, 'TCommonThreadPool.Worker');
   try
@@ -1772,11 +1773,16 @@ begin
     for I := Len - 1 downto 0 do begin
       Worker := FWorkers[I];
 
-      if (Worker.State = wsIdle) and (NowTick - Worker.LastActiveTick >= FIdleTimeoutMs) then begin
-        Worker.SetState(wsStopping);
+      if (Worker.ThreadID <> TThread.CurrentThread.ThreadID)
+          and (Worker.State = wsIdle)
+          and (NowTick - Worker.LastActiveTick >= FIdleTimeoutMs) then begin
+        WorkerToRetire := Worker;
+        WorkerToRetire.SetState(wsStopping);
 
-        Dec(FWorkersIdle);
         Dec(FWorkersTotal);
+        Dec(FBaseCount);
+        if FBaseCount < 0 then
+          FBaseCount := 0;
 
         // Shift elements down
         for J := I to Len - 2 do
@@ -1784,17 +1790,19 @@ begin
 
         SetLength(FWorkers, Len - 1);
 
-        // Terminate and free the worker
-        Worker.Terminate;
-        FQueueEvent.SetEvent;
-        Worker.WaitFor;
-        Worker.Free;
-
-        Exit; // retire ONE at a time
-      end;
+        Break; // retire ONE at a time
+      end
     end;
   finally
     TLockDiagnostics.CriticalSectionExit(FWorkerCS, 'TCommonThreadPool.Worker');
+  end;
+
+  if WorkerToRetire <> nil then begin
+    // Terminate and free the worker outside lock to prevent deadlock
+    WorkerToRetire.Terminate;
+    FQueueEvent.SetEvent;
+    WorkerToRetire.WaitFor;
+    WorkerToRetire.Free;
   end;
 end;
 
@@ -1900,8 +1908,10 @@ begin
     W := TWorker.Create(Self);
     W.FKind := wkBurst;
     W.FTaskKind := -1;
+    W.FState := wsBusy;
     Inc(FWorkersTotal);
     Inc(FWorkersBurst);
+    Inc(FWorkersBusy);
 
     SetLength(FBurstWorkers, Length(FBurstWorkers) + 1);
     FBurstWorkers[High(FBurstWorkers)] := W;
@@ -1923,6 +1933,7 @@ begin
     Worker := TWorker.Create(Self);
     Inc(FWorkersTotal);
     Inc(FWorkersIdle);
+    Inc(FBaseCount);
 
     Worker.FreeOnTerminate := False;
 
@@ -2147,12 +2158,12 @@ begin
     Result.MinWorkers := FMinWorkers;
     Result.MaxWorkers := FMaxWorkers;
     Result.TotalWorkers := FWorkersTotal;
-    Result.BusyWorkers := FWorkersBusy;
-    Result.IdleWorkers := FWorkersIdle;
+    Result.BusyWorkers := Max(0, FWorkersBusy);
+    Result.IdleWorkers := Max(0, FWorkersIdle);
     Result.BaseWorkers := FBaseCount;
     Result.QuotaWorkers := FQuotaCount;
     Result.DynamicWorkers := FDynamicCount;
-    Result.BurstWorkers := FBurstCount;
+    Result.BurstWorkers := FWorkersBurst;
   finally
     Log(
         Format('[NEWS_STATS] WORKER_LOCK RELEASING Lock=%p Pool=%p Thread=%d HeldMs=%d',
