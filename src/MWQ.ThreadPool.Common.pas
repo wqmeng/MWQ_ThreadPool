@@ -249,7 +249,8 @@ type
         AKey: UIntPtr = 0;
         ADeadlineTick: UInt64 = 0;
         ACanRetry: Boolean = False;
-        AContext: TObject = nil
+        AContext: TObject = nil;
+        const AContextLease: IInterface = nil
     ); static;
     class procedure RegisterTaskKind(
         AKind: Integer;
@@ -342,6 +343,7 @@ type
     FDone: Boolean;
     FDeadlineTick: UInt64;
     FContext: TObject;
+    FContextLease: IInterface;
   public
     constructor Create(
         const AFunc: TFunc<Boolean>;
@@ -351,7 +353,8 @@ type
         AKey: UIntPtr;
         ADeadlineTick: UInt64;
         ACanRetry: Boolean;
-        AContext: TObject
+        AContext: TObject;
+        const AContextLease: IInterface
     );
     destructor Destroy; override;
     function Key: UIntPtr;
@@ -703,10 +706,11 @@ begin
 
     finally
       try
-        Task.Cleanup;
-      finally
         // Release the exact acquired instance, even if cleanup changes task state or raises.
         FOwner.LeaveKey(LKeyLock, LKey);
+      finally
+        // A task closure can own lifetime leases; release them only after the key lock.
+        Task.Cleanup;
       end;
 
       if LQuotaEntered then begin
@@ -1002,7 +1006,8 @@ constructor TAnonymousThreadTask.Create(
     AOwner, AKey: UIntPtr;
     ADeadlineTick: UInt64;
     ACanRetry: Boolean;
-    AContext: TObject
+    AContext: TObject;
+    const AContextLease: IInterface
 );
 begin
   inherited Create;
@@ -1015,6 +1020,7 @@ begin
   FCanRetry := ACanRetry;
   FDone := False;
   FContext := AContext;
+  FContextLease := AContextLease;
 end;
 
 function TAnonymousThreadTask.Key: UIntPtr;
@@ -1335,7 +1341,7 @@ begin
 
   { Enqueue task }
   Log('TP Task before enqueue=%p Kind=%d Key=%x Priority=%d',
-    [Pointer(Task), Kind, TaskKey, PriorityValue], etWarning);
+    [Pointer(Task), Kind, TaskKey, PriorityValue], etDebug);
   TLockDiagnostics.CriticalSectionEnter(FQueueLocks[P], 'TCommonThreadPool.Queue');
   try
     FQueues[P].Enqueue(Task);
@@ -1353,7 +1359,7 @@ begin
     TLockDiagnostics.CriticalSectionExit(FQueueLocks[P], 'TCommonThreadPool.Queue');
   end;
   Log('TP Task after enqueue=%p Kind=%d Key=%x Priority=%d',
-    [Pointer(Task), Kind, TaskKey, PriorityValue], etWarning);
+    [Pointer(Task), Kind, TaskKey, PriorityValue], etDebug);
 
 {$IFDEF DEBUG}
   Log(
@@ -1401,7 +1407,8 @@ class procedure TCommonThreadPool.EnqueueProc(
     AKey: UIntPtr = 0;
     ADeadlineTick: UInt64 = 0;
     ACanRetry: Boolean = False;
-    AContext: TObject = nil
+    AContext: TObject = nil;
+    const AContextLease: IInterface = nil
 );
 var
   LPool: TCommonThreadPool;
@@ -1420,7 +1427,8 @@ begin
 
   EnqueueTask(
       TAnonymousThreadTask
-          .Create(AFunc, LEffectivePriority, AKind, ATaskOwner, AKey, ADeadlineTick, ACanRetry, AContext)
+          .Create(AFunc, LEffectivePriority, AKind, ATaskOwner, AKey, ADeadlineTick, ACanRetry,
+            AContext, AContextLease)
   );
 end;
 
@@ -1746,7 +1754,7 @@ begin
   end;
 
   // Now safe to free (outside lock)
-  Worker.Free;
+  // Worker will self-destroy upon Execute exit; do not call Worker.Free here (calling WaitFor on Self deadlocks)
 end;
 
 class procedure TCommonThreadPool.RegisterTaskKind(
@@ -1927,6 +1935,7 @@ begin
 
     SetLength(FBurstWorkers, Length(FBurstWorkers) + 1);
     FBurstWorkers[High(FBurstWorkers)] := W;
+    W.FreeOnTerminate := True;
     W.Start;
   finally
     TLockDiagnostics.CriticalSectionExit(FWorkerCS, 'TCommonThreadPool.Worker');
